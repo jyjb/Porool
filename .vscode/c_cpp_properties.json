@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "name": "Win32 (MSYS2 ucrt64)",
+            "includePath": [
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/../Sorkuvai/include",
+                "D:/programing/msys64/ucrt64/include"
+            ],
+            "defines": [
+                "_WIN32",
+                "POROOL_EXPORTS"
+            ],
+            "compilerPath": "D:/programing/msys64/ucrt64/bin/gcc.exe",
+            "cStandard": "c99",
+            "intelliSenseMode": "windows-gcc-x64"
+        }
+    ],
+    "version": 4
+}
