@@ -127,6 +127,109 @@ static int qhit_cmp(const void *a, const void *b) {
     return (d > 0.0f) ? 1 : (d < 0.0f) ? -1 : 0;
 }
 
+/* ── Composite scoring ──────────────────────────────────────────────────── */
+
+typedef struct { float w1, w2, w3, opt_len, sigma; } ScoreConfig;
+
+static void read_score_config(const char *ini_path, ScoreConfig *cfg)
+{
+    cfg->w1 = 0.60f; cfg->w2 = 0.20f; cfg->w3 = 0.20f;
+    cfg->opt_len = 500.0f; cfg->sigma = 200.0f;
+
+    FILE *f = fopen(ini_path, "r");
+    if (!f) return;
+
+    char line[256]; int in_scoring = 0, in_porool = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ';' || *p == '#' || *p == '\r' || *p == '\n' || !*p) continue;
+
+        if (*p == '[') {
+            char *end = strchr(p + 1, ']');
+            if (!end) continue;
+            char sec[64]; int sl = (int)(end - p - 1);
+            if (sl >= (int)sizeof(sec)) sl = (int)sizeof(sec) - 1;
+            strncpy(sec, p + 1, sl); sec[sl] = '\0';
+            in_scoring = !strcmp(sec, "scoring");
+            in_porool  = !strcmp(sec, "porool");
+            continue;
+        }
+
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        char key[64]; int klen = (int)(eq - p);
+        while (klen > 0 && (p[klen-1]==' '||p[klen-1]=='\t')) klen--;
+        if (klen <= 0 || klen >= (int)sizeof(key)) continue;
+        strncpy(key, p, klen); key[klen] = '\0';
+
+        char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        int vlen = (int)strlen(val);
+        while (vlen > 0 && (val[vlen-1]=='\n'||val[vlen-1]=='\r'||val[vlen-1]==' ')) val[--vlen]='\0';
+        if (!vlen) continue;
+
+        float fv = (float)atof(val);
+        if (in_scoring) {
+            if      (!strcmp(key, "w1")) cfg->w1 = fv;
+            else if (!strcmp(key, "w2")) cfg->w2 = fv;
+            else if (!strcmp(key, "w3")) cfg->w3 = fv;
+        }
+        if (in_porool) {
+            if      (!strcmp(key, "optimal_chunk_len"))    cfg->opt_len = fv;
+            else if (!strcmp(key, "length_penalty_sigma")) cfg->sigma   = fv;
+        }
+    }
+    fclose(f);
+}
+
+/* Gaussian length score: 1.0 at opt_len, falls off with sigma. */
+static float length_score_fn(int chunk_len, float opt, float sigma)
+{
+    float d = ((float)chunk_len - opt) / sigma;
+    return expf(-0.5f * d * d);
+}
+
+/* Fraction of distinct query words (>2 chars) found in chunk text. */
+static float keyword_density_score(const char *query, const char *chunk)
+{
+    char qbuf[4096];
+    strncpy(qbuf, query, sizeof(qbuf) - 1); qbuf[sizeof(qbuf) - 1] = '\0';
+    for (char *c = qbuf; *c; c++) *c = (char)tolower((unsigned char)*c);
+
+    char cbuf[8192];
+    strncpy(cbuf, chunk, sizeof(cbuf) - 1); cbuf[sizeof(cbuf) - 1] = '\0';
+    for (char *c = cbuf; *c; c++) *c = (char)tolower((unsigned char)*c);
+
+    int total = 0, found = 0;
+    char *tok = strtok(qbuf, " \t\n\r.,;:!?\"'()[]{}");
+    while (tok) {
+        if (strlen(tok) > 2) {
+            total++;
+            if (strstr(cbuf, tok)) found++;
+        }
+        tok = strtok(NULL, " \t\n\r.,;:!?\"'()[]{}");
+    }
+    return (total > 0) ? ((float)found / (float)total) : 0.0f;
+}
+
+/* Replace raw cosine scores with composite: cosine*w1 + length*w2 + keyword*w3. */
+static void rerank_hits(QHit *hits, int nhits,
+                        const char *query, const ScoreConfig *cfg)
+{
+    for (int i = 0; i < nhits; i++) {
+        float cosine = hits[i].score;
+        float lscore = hits[i].text
+                       ? length_score_fn((int)strlen(hits[i].text),
+                                         cfg->opt_len, cfg->sigma)
+                       : 0.0f;
+        float kscore = (hits[i].text && query)
+                       ? keyword_density_score(query, hits[i].text)
+                       : 0.0f;
+        hits[i].score = cosine * cfg->w1 + lscore * cfg->w2 + kscore * cfg->w3;
+    }
+}
+
 /* ── Text normalization ─────────────────────────────────────────────────── */
 
 static void normalize(char *s)
@@ -724,6 +827,8 @@ static int cmd_query(int argc, char **argv)
             free(qv); ve_cleanup(); return 1;
         }
         int nhits = collect_hits(chunks, vecs, qv, d, topk, hits, 0, topk);
+        ScoreConfig scfg; read_score_config(DEFAULT_POROOL_INI, &scfg);
+        rerank_hits(hits, nhits, query_text, &scfg);
         print_hits(hits, nhits, topk, max_chars, query_text);
         for (int i = 0; i < nhits; i++) { free(hits[i].text); free(hits[i].source); }
         free(hits); free(qv);
@@ -809,6 +914,8 @@ static int cmd_query(int argc, char **argv)
         tde_close(chunks); tde_close(vecs);
     }
 
+    ScoreConfig scfg; read_score_config(DEFAULT_POROOL_INI, &scfg);
+    rerank_hits(hits, nhits, query_text, &scfg);
     print_hits(hits, nhits, topk, max_chars, query_text);
     for (int i = 0; i < nhits; i++) { free(hits[i].text); free(hits[i].source); }
     free(hits); free(qv);
