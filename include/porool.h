@@ -93,6 +93,31 @@ POROOL_API char *porool_query_from(const char *query,
                                     const char *table_name,
                                     int top_k, int max_chars);
 
+/* Unified-target retrieve: target may be "ALL", "db", or "db.table".
+ * Behaviour matches porool_retrieve_from; see its docs for return/ownership. */
+POROOL_API SearchResult *porool_retrieve_target(float      *query_vector,
+                                                 const char *target,
+                                                 int         top_k,
+                                                 int        *result_count);
+
+/* Unified-target all-in-one pipeline: embed → retrieve → rerank → context.
+ * target follows the same "ALL" / "db" / "db.table" convention.
+ * top_k ≤ 0 and max_chars ≤ 0 use porool.ini defaults.
+ * Caller must free with porool_free(). */
+POROOL_API char *porool_query_target(const char *query,
+                                      const char *target,
+                                      int top_k, int max_chars);
+
+/* Reload the phrasing cache from the phrasing.query_prefixes and
+ * phrasing.chunk_markers ODAT tables (call after external edits to those tables). */
+POROOL_API void porool_phrasing_reload(void);
+
+/* Add a pattern to a phrasing table and reload the cache.
+ * is_prefix=1 → phrasing.query_prefixes (e.g. "tell me about ").
+ * is_prefix=0 → phrasing.chunk_markers  (e.g. " is defined as ").
+ * Returns 0 on success, -1 if duplicate, -2 on error. */
+POROOL_API int  porool_phrasing_add(const char *pattern, int is_prefix);
+
 /* Free a string returned by porool_embed_query / porool_build_context /
  * porool_query / porool_query_from. */
 POROOL_API void porool_free(char *ptr);

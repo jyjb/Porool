@@ -22,6 +22,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <ctype.h>
 #include "../include/porool_extract.h"
 
 /* ── Sorkuvai.dll forward declarations ──────────────────────────────────────*/
@@ -92,7 +93,7 @@ typedef struct {
     float optimal_chunk_len;
     float length_penalty_sigma;
     float default_source_weight;
-    float w1, w2, w3;
+    float w1, w2, w3, w4;
     source_weight_t source_weights[MAX_SOURCE_WEIGHTS];
     int             source_weight_count;
 } PoroolConfig;
@@ -102,12 +103,32 @@ static tde_handle_t  g_chunks  = NULL;
 static tde_handle_t  g_vectors = NULL;
 static int           g_ready   = 0;
 
+/* ── Phrasing cache ──────────────────────────────────────────────────────────*/
+
+#define PHRASE_PREFIXES_LOGICAL "phrasing.query_prefixes"
+#define PHRASE_MARKERS_LOGICAL  "phrasing.chunk_markers"
+#define MAX_PHRASES 128
+
+static char *g_prefixes[MAX_PHRASES]; static int g_nprefixes;
+static char *g_markers [MAX_PHRASES]; static int g_nmarkers;
+
+static const char *k_def_prefixes[] = {
+    "what is", "what are", "what's", "define ", "explain ", "describe "
+};
+static const char *k_def_markers[] = {
+    " is a ", " is an ", " are a ", " refers to ", " defined as ",
+    " is defined ", " represents a ", " represent a ", " represent an ",
+    " known as ", " stands for "
+};
+
 /* ── Directory helper ───────────────────────────────────────────────────────*/
 
 #ifdef _WIN32
+#  include <windows.h>
 #  include <direct.h>
 #  define p_mkdir(p) _mkdir(p)
 #else
+#  include <glob.h>
 #  include <sys/stat.h>
 #  define p_mkdir(p) mkdir((p), 0755)
 #endif
@@ -148,10 +169,12 @@ static void write_default_ini(const char *path)
         "\n"
         "[scoring]\n"
         "; Composite score = cosine*w1 + length_score*w2 + source_score*w3\n"
-        "; Weights should sum to 1.0\n"
+        ";   + definition_signal*w4  (only when query is definitional, e.g. \"what is X?\")\n"
+        "; w1+w2+w3 should sum to 1.0; w4 is an additive bonus (0 = disabled)\n"
         "w1 = 0.60\n"
         "w2 = 0.20\n"
         "w3 = 0.20\n"
+        "w4 = 0.15\n"
         "\n"
         "[source_weights]\n"
         "; Per-source priority multipliers.  Range [0.0, 2.0]; values outside are clamped.\n"
@@ -188,7 +211,7 @@ static int load_config(const char *path)
     g_cfg.optimal_chunk_len     = 500.0f;
     g_cfg.length_penalty_sigma  = 200.0f;
     g_cfg.default_source_weight = 1.0f;
-    g_cfg.w1 = 0.6f; g_cfg.w2 = 0.2f; g_cfg.w3 = 0.2f;
+    g_cfg.w1 = 0.6f; g_cfg.w2 = 0.2f; g_cfg.w3 = 0.2f; g_cfg.w4 = 0.0f;
     g_cfg.source_weight_count   = 0;
 
     FILE *fp = fopen(path, "r");
@@ -247,6 +270,7 @@ static int load_config(const char *path)
             if      (!strcmp(key, "w1")) g_cfg.w1 = (float)strtod(val, NULL);
             else if (!strcmp(key, "w2")) g_cfg.w2 = (float)strtod(val, NULL);
             else if (!strcmp(key, "w3")) g_cfg.w3 = (float)strtod(val, NULL);
+            else if (!strcmp(key, "w4")) g_cfg.w4 = (float)strtod(val, NULL);
         } else if (strcmp(section, "source_weights") == 0) {
             if (g_cfg.source_weight_count < MAX_SOURCE_WEIGHTS) {
                 source_weight_t *sw = &g_cfg.source_weights[g_cfg.source_weight_count++];
@@ -258,6 +282,60 @@ static int load_config(const char *path)
 
     fclose(fp);
     return 0;
+}
+
+/* ── Phrasing helpers ────────────────────────────────────────────────────────*/
+
+static void phrases_free(char **arr, int *count)
+{
+    for (int i = 0; i < *count; i++) { free(arr[i]); arr[i] = NULL; }
+    *count = 0;
+}
+
+static void phrases_load(const char *logical, char **arr, int *count)
+{
+    *count = 0;
+    tde_handle_t h = tde_open_odat(logical);
+    if (!h) return;
+    int n = tde_row_count(h);
+    for (int i = 0; i < n && *count < MAX_PHRASES; i++) {
+        int need = tde_get_string(h, i, 0, NULL, 0);
+        if (need <= 0) continue;
+        char *s = (char *)malloc((size_t)need);
+        if (!s) continue;
+        if (tde_get_string(h, i, 0, s, need) > 0 && s[0])
+            arr[(*count)++] = s;
+        else
+            free(s);
+    }
+    tde_close(h);
+}
+
+static void phrases_ensure(const char *logical,
+                            const char **defaults, int ndefaults)
+{
+    tde_handle_t h = tde_open_odat(logical);
+    if (h) { tde_close(h); return; }
+    const char *cols[] = { "pattern" };
+    tde_handle_t tbl = tde_create(cols, 1);
+    if (!tbl) return;
+    for (int i = 0; i < ndefaults; i++) {
+        tde_handle_t row = tde_row_begin(tbl);
+        if (!row) continue;
+        tde_row_set_string(row, 0, defaults[i]);
+        tde_row_commit(row);
+    }
+    ensure_db_subdir(g_cfg.data_dir, "phrasing");
+    tde_save_logical(tbl, logical);
+    tde_close(tbl);
+}
+
+static void phrases_reload(void)
+{
+    phrases_free(g_prefixes, &g_nprefixes);
+    phrases_free(g_markers,  &g_nmarkers);
+    phrases_load(PHRASE_PREFIXES_LOGICAL, g_prefixes, &g_nprefixes);
+    phrases_load(PHRASE_MARKERS_LOGICAL,  g_markers,  &g_nmarkers);
 }
 
 /* ── Init / shutdown ─────────────────────────────────────────────────────────*/
@@ -284,6 +362,13 @@ POROOL_API int porool_init(const char *config_path)
     g_vectors = tde_open_ovec(g_cfg.vectors_table);
     if (!g_vectors) { tde_close(g_chunks); g_chunks = NULL; return -6; }
 
+    /* 5. Ensure phrasing tables exist then load into cache */
+    phrases_ensure(PHRASE_PREFIXES_LOGICAL, k_def_prefixes,
+                   (int)(sizeof(k_def_prefixes)/sizeof(k_def_prefixes[0])));
+    phrases_ensure(PHRASE_MARKERS_LOGICAL,  k_def_markers,
+                   (int)(sizeof(k_def_markers)/sizeof(k_def_markers[0])));
+    phrases_reload();
+
     g_ready = 1;
     return 0;
 }
@@ -292,6 +377,8 @@ POROOL_API void porool_shutdown(void)
 {
     if (g_vectors) { tde_close(g_vectors); g_vectors = NULL; }
     if (g_chunks)  { tde_close(g_chunks);  g_chunks  = NULL; }
+    phrases_free(g_prefixes, &g_nprefixes);
+    phrases_free(g_markers,  &g_nmarkers);
     if (g_ready)   { ve_cleanup(); }
     g_ready = 0;
 }
@@ -419,6 +506,58 @@ static int cmp_results_desc(const void *a, const void *b)
     return (sa > sb) ? -1 : (sa < sb) ? 1 : 0;
 }
 
+/* Returns 1 if the query is a definitional intent ("what is X?", "define X", etc.) */
+static int is_definitional_query(const char *q)
+{
+    if (!q) return 0;
+    while (*q == ' ' || *q == '\t') q++;
+    char buf[64];
+    int i = 0;
+    while (i < 63 && q[i]) { buf[i] = (char)tolower((unsigned char)q[i]); i++; }
+    buf[i] = '\0';
+    int n          = g_nprefixes > 0 ? g_nprefixes
+                                     : (int)(sizeof(k_def_prefixes)/sizeof(k_def_prefixes[0]));
+    const char **list = g_nprefixes > 0 ? (const char **)g_prefixes : k_def_prefixes;
+    for (int p = 0; p < n; p++)
+        if (strncmp(buf, list[p], strlen(list[p])) == 0) return 1;
+    return 0;
+}
+
+/* Returns [0.0, 1.0] measuring how many definitional markers appear in first 400 chars. */
+static float definition_content_score(const char *text)
+{
+    if (!text) return 0.0f;
+    char buf[401];
+    int i = 0;
+    while (i < 400 && text[i]) { buf[i] = (char)tolower((unsigned char)text[i]); i++; }
+    buf[i] = '\0';
+    int n          = g_nmarkers > 0 ? g_nmarkers
+                                    : (int)(sizeof(k_def_markers)/sizeof(k_def_markers[0]));
+    const char **list = g_nmarkers > 0 ? (const char **)g_markers : k_def_markers;
+    int hits = 0;
+    for (int m = 0; m < n; m++)
+        if (strstr(buf, list[m])) hits++;
+    if (hits == 0) return 0.0f;
+    return 1.0f;
+}
+
+/* Like porool_rerank but incorporates query intent when w4 > 0. Used internally. */
+static void rerank_internal(SearchResult *results, int count, const char *query)
+{
+    if (!results || count <= 0) return;
+    float w1 = g_cfg.w1, w2 = g_cfg.w2, w3 = g_cfg.w3, w4 = g_cfg.w4;
+    int is_def = (w4 > 0.0f) ? is_definitional_query(query) : 0;
+    for (int i = 0; i < count; i++) {
+        float cosine = results[i].score;
+        float lscore = length_score(results[i].text);
+        float wsrc   = source_weight_lookup(results[i].source);
+        float sscore = wsrc > 2.0f ? 1.0f : wsrc * 0.5f;
+        float dscore = is_def ? definition_content_score(results[i].text) : 0.0f;
+        results[i].score = cosine * w1 + lscore * w2 + sscore * w3 + dscore * w4;
+    }
+    qsort(results, (size_t)count, sizeof(SearchResult), cmp_results_desc);
+}
+
 POROOL_API void porool_rerank(SearchResult *results, int count)
 {
     if (!results || count <= 0) return;
@@ -501,7 +640,7 @@ POROOL_API char *porool_query(const char *query, int top_k, int max_chars)
     free(emb);
     if (!res) return NULL;
 
-    porool_rerank(res, n);
+    rerank_internal(res, n, query);
 
     char *ctx = porool_build_context(res, n, max_chars);
     porool_free_results(res, n);
@@ -547,12 +686,73 @@ static int registry_read(const char *db, char out[][256], int max_out)
     return n;
 }
 
+/* Scan data_dir for *.tables files and collect every "db.table" entry.
+ * Returns total count. */
+static int registry_read_all(char out[][256], int max_out)
+{
+    int n = 0;
+#ifdef _WIN32
+    char pat[640];
+    snprintf(pat, sizeof(pat), "%s/*.tables", g_cfg.data_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        char *fn = fd.cFileName;
+        int fl = (int)strlen(fn);
+        if (fl <= 7) continue; /* ".tables" = 7 chars */
+        char db[256];
+        int dl = fl - 7;
+        if (dl >= (int)sizeof(db)) continue;
+        memcpy(db, fn, (size_t)dl); db[dl] = '\0';
+        n += registry_read(db, out + n, max_out - n);
+    } while (n < max_out && FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    char pat[640];
+    snprintf(pat, sizeof(pat), "%s/*.tables", g_cfg.data_dir);
+    glob_t g = {0};
+    if (glob(pat, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc && n < max_out; i++) {
+            const char *base = strrchr(g.gl_pathv[i], '/');
+            base = base ? base + 1 : g.gl_pathv[i];
+            int bl = (int)strlen(base);
+            if (bl <= 7) continue;
+            char db[256];
+            int dl = bl - 7;
+            if (dl >= (int)sizeof(db)) continue;
+            memcpy(db, base, (size_t)dl); db[dl] = '\0';
+            n += registry_read(db, out + n, max_out - n);
+        }
+        globfree(&g);
+    }
+#endif
+    return n;
+}
+
+/* Parse a target string into db and optional table components.
+ * Returns 2 = all dbs, 1 = all tables in db, 0 = specific db.table. */
+static int parse_target(const char *target, char *db_out, int db_sz,
+                         char *tbl_out, int tbl_sz)
+{
+    db_out[0] = tbl_out[0] = '\0';
+    if (!target || !*target || !strcasecmp(target, "all") || !strcmp(target, "*"))
+        return 2;
+    const char *dot = strchr(target, '.');
+    if (!dot) {
+        snprintf(db_out, (size_t)db_sz, "%s", target);
+        return 1;
+    }
+    int dl = (int)(dot - target);
+    snprintf(db_out,  (size_t)db_sz,  "%.*s", dl, target);
+    snprintf(tbl_out, (size_t)tbl_sz, "%s",   dot + 1);
+    return 0;
+}
+
 /* ── Ingest helpers ──────────────────────────────────────────────────────────*/
 
 #define POROOL_CHUNK_CHARS   500
 #define POROOL_CHUNK_OVERLAP 50
-
-#include <ctype.h>
 
 static void p_normalize(char *s)
 {
@@ -854,10 +1054,138 @@ POROOL_API char *porool_query_from(const char *query,
     free(emb);
     if (!res) return NULL;
 
-    porool_rerank(res, n);
+    rerank_internal(res, n, query);
     char *ctx = porool_build_context(res, n, max_chars);
     porool_free_results(res, n);
     return ctx;
+}
+
+/* ── Target-string API ───────────────────────────────────────────────────────*/
+
+POROOL_API SearchResult *porool_retrieve_target(float      *query_vector,
+                                                 const char *target,
+                                                 int         top_k,
+                                                 int        *result_count)
+{
+    if (!query_vector || top_k <= 0 || !result_count || !g_ready) return NULL;
+    char db[256], tbl[256];
+    int mode = parse_target(target, db, sizeof(db), tbl, sizeof(tbl));
+
+    if (mode == 0) return porool_retrieve_from(query_vector, db, tbl,  top_k, result_count);
+    if (mode == 1) return porool_retrieve_from(query_vector, db, NULL, top_k, result_count);
+
+    /* mode 2: all databases */
+#define ALL_MAX (64 * 4)
+    char tables[ALL_MAX][256];
+    int ntables = registry_read_all(tables, ALL_MAX);
+    if (ntables == 0) { *result_count = 0; return NULL; }
+
+    int d = sk_get_dim();
+    int cap = top_k * ntables;
+    SearchResult *all = (SearchResult *)calloc((size_t)cap, sizeof(SearchResult));
+    if (!all) { *result_count = 0; return NULL; }
+    uint32_t *ids    = (uint32_t *)malloc((size_t)top_k * sizeof(uint32_t));
+    float    *scores = (float *)   malloc((size_t)top_k * sizeof(float));
+    if (!ids || !scores) { free(ids); free(scores); free(all); *result_count = 0; return NULL; }
+
+    int total = 0;
+    for (int t = 0; t < ntables && total < cap; t++) {
+        char vl[264]; snprintf(vl, sizeof(vl), "%.256s_vec", tables[t]);
+        tde_handle_t ch = tde_open_odat(tables[t]);
+        tde_handle_t vh = tde_open_ovec(vl);
+        if (!ch || !vh) { if (ch) tde_close(ch); if (vh) tde_close(vh); continue; }
+        int found = tde_vector_search_topk(vh, query_vector, (uint32_t)d, (uint32_t)top_k, ids, scores);
+        int space = cap - total;
+        int take  = found < space ? found : space;
+        for (int i = 0; i < take; i++) {
+            all[total + i].id     = ids[i];
+            all[total + i].score  = scores[i];
+            all[total + i].text   = fetch_string(ch, (int)ids[i], 0);
+            all[total + i].source = fetch_string(ch, (int)ids[i], 1);
+        }
+        total += take;
+        tde_close(ch); tde_close(vh);
+    }
+    free(ids); free(scores);
+    if (total == 0) { free(all); *result_count = 0; return NULL; }
+
+    qsort(all, (size_t)total, sizeof(SearchResult), cmp_results_desc);
+    for (int i = top_k; i < total; i++) { free(all[i].text); free(all[i].source); }
+    *result_count = total < top_k ? total : top_k;
+    return all;
+#undef ALL_MAX
+}
+
+POROOL_API char *porool_query_target(const char *query, const char *target,
+                                      int top_k, int max_chars)
+{
+    if (!query || !g_ready) return NULL;
+    if (top_k     <= 0) top_k     = g_cfg.top_k_default;
+    if (max_chars <= 0) max_chars = g_cfg.max_context_chars;
+
+    float *emb = NULL; int dim = 0;
+    if (porool_embed_query(query, &emb, &dim) != 0) return NULL;
+
+    int n = 0;
+    SearchResult *res = porool_retrieve_target(emb, target, top_k, &n);
+    free(emb);
+    if (!res) return NULL;
+
+    rerank_internal(res, n, query);
+    char *ctx = porool_build_context(res, n, max_chars);
+    porool_free_results(res, n);
+    return ctx;
+}
+
+/* ── Phrasing API ────────────────────────────────────────────────────────────*/
+
+POROOL_API void porool_phrasing_reload(void)
+{
+    if (!g_ready) return;
+    phrases_reload();
+}
+
+/*
+ * Add a pattern to the phrasing table and reload the cache.
+ * is_prefix=1 → query_prefixes table; is_prefix=0 → chunk_markers table.
+ * Returns 0 on success, -1 if duplicate, -2 on error.
+ */
+POROOL_API int porool_phrasing_add(const char *pattern, int is_prefix)
+{
+    if (!pattern || !pattern[0] || !g_ready) return -2;
+    const char *logical = is_prefix ? PHRASE_PREFIXES_LOGICAL : PHRASE_MARKERS_LOGICAL;
+    char **cache        = is_prefix ? g_prefixes : g_markers;
+    int   *count        = is_prefix ? &g_nprefixes : &g_nmarkers;
+
+    for (int i = 0; i < *count; i++)
+        if (cache[i] && strcmp(cache[i], pattern) == 0) return -1;
+
+    tde_handle_t old   = tde_open_odat(logical);
+    int          old_n = old ? tde_row_count(old) : 0;
+    const char  *cols[] = { "pattern" };
+    tde_handle_t tbl   = tde_create(cols, 1);
+    if (!tbl) { if (old) tde_close(old); return -2; }
+
+    for (int i = 0; i < old_n; i++) {
+        int need = tde_get_string(old, i, 0, NULL, 0);
+        if (need <= 0) continue;
+        char *s = (char *)malloc((size_t)need);
+        if (!s) continue;
+        if (tde_get_string(old, i, 0, s, need) > 0) {
+            tde_handle_t row = tde_row_begin(tbl);
+            if (row) { tde_row_set_string(row, 0, s); tde_row_commit(row); }
+        }
+        free(s);
+    }
+    if (old) tde_close(old);
+
+    tde_handle_t row = tde_row_begin(tbl);
+    if (row) { tde_row_set_string(row, 0, pattern); tde_row_commit(row); }
+
+    if (tde_save_logical(tbl, logical) != TDE_OK) { tde_close(tbl); return -2; }
+    tde_close(tbl);
+    phrases_reload();
+    return 0;
 }
 
 /* ── Memory management ───────────────────────────────────────────────────────*/

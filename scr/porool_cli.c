@@ -29,9 +29,11 @@
 
 #ifdef _WIN32
 #  include <windows.h>
+#  include <direct.h>
 #  define strcasecmp _stricmp
 #else
 #  include <glob.h>
+#  include <sys/stat.h>
 #endif
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
@@ -121,6 +123,72 @@ static int cli_show_tables(const char *data_dir, char logical[][512], int max)
     return n;
 }
 
+/* ── Phrasing cache ──────────────────────────────────────────────────────────*/
+
+#define PHRASE_PREFIXES_LOGICAL "phrasing.query_prefixes"
+#define PHRASE_MARKERS_LOGICAL  "phrasing.chunk_markers"
+#define MAX_PHRASES 128
+
+static char *g_prefixes[MAX_PHRASES]; static int g_nprefixes;
+static char *g_markers [MAX_PHRASES]; static int g_nmarkers;
+
+static const char *k_def_prefixes[] = {
+    "what is", "what are", "what's", "define ", "explain ", "describe "
+};
+static const char *k_def_markers[] = {
+    " is a ", " is an ", " are a ", " refers to ", " defined as ",
+    " is defined ", " represents a ", " represent a ", " represent an ",
+    " known as ", " stands for "
+};
+
+static void phrases_load(const char *logical, char **arr, int *count)
+{
+    *count = 0;
+    tde_handle_t h = tde_open_odat(logical);
+    if (!h) return;
+    int n = tde_row_count(h);
+    for (int i = 0; i < n && *count < MAX_PHRASES; i++) {
+        int need = tde_get_string(h, i, 0, NULL, 0);
+        if (need <= 0) continue;
+        char *s = (char *)malloc((size_t)need);
+        if (!s) continue;
+        if (tde_get_string(h, i, 0, s, need) > 0 && s[0])
+            arr[(*count)++] = s;
+        else
+            free(s);
+    }
+    tde_close(h);
+}
+
+static void phrases_ensure(const char *logical,
+                            const char **defaults, int ndefaults,
+                            const char *data_dir)
+{
+    tde_handle_t h = tde_open_odat(logical);
+    if (h) { tde_close(h); return; }
+    const char *cols[] = { "pattern" };
+    tde_handle_t tbl = tde_create(cols, 1);
+    if (!tbl) return;
+    for (int i = 0; i < ndefaults; i++) {
+        tde_handle_t row = tde_row_begin(tbl);
+        if (!row) continue;
+        tde_row_set_string(row, 0, defaults[i]);
+        tde_row_commit(row);
+    }
+    /* ensure data_dir/phrasing/ exists */
+#ifdef _WIN32
+    { char p[512]; snprintf(p, sizeof(p), "%s", data_dir);   _mkdir(p); }
+    { char p[512]; snprintf(p, sizeof(p), "%s/phrasing", data_dir); _mkdir(p); }
+#else
+    { char p[512]; snprintf(p, sizeof(p), "%s", data_dir);   mkdir(p, 0755); }
+    { char p[512]; snprintf(p, sizeof(p), "%s/phrasing", data_dir); mkdir(p, 0755); }
+#endif
+    tde_save_logical(tbl, logical);
+    tde_close(tbl);
+}
+
+/* ── QHit ────────────────────────────────────────────────────────────────────*/
+
 typedef struct { char *text; char *source; float score; } QHit;
 static int qhit_cmp(const void *a, const void *b) {
     float d = ((const QHit *)b)->score - ((const QHit *)a)->score;
@@ -129,11 +197,11 @@ static int qhit_cmp(const void *a, const void *b) {
 
 /* ── Composite scoring ──────────────────────────────────────────────────── */
 
-typedef struct { float w1, w2, w3, opt_len, sigma; } ScoreConfig;
+typedef struct { float w1, w2, w3, w4, opt_len, sigma; } ScoreConfig;
 
 static void read_score_config(const char *ini_path, ScoreConfig *cfg)
 {
-    cfg->w1 = 0.60f; cfg->w2 = 0.20f; cfg->w3 = 0.20f;
+    cfg->w1 = 0.60f; cfg->w2 = 0.20f; cfg->w3 = 0.20f; cfg->w4 = 0.0f;
     cfg->opt_len = 500.0f; cfg->sigma = 200.0f;
 
     FILE *f = fopen(ini_path, "r");
@@ -174,6 +242,7 @@ static void read_score_config(const char *ini_path, ScoreConfig *cfg)
             if      (!strcmp(key, "w1")) cfg->w1 = fv;
             else if (!strcmp(key, "w2")) cfg->w2 = fv;
             else if (!strcmp(key, "w3")) cfg->w3 = fv;
+            else if (!strcmp(key, "w4")) cfg->w4 = fv;
         }
         if (in_porool) {
             if      (!strcmp(key, "optimal_chunk_len"))    cfg->opt_len = fv;
@@ -213,10 +282,45 @@ static float keyword_density_score(const char *query, const char *chunk)
     return (total > 0) ? ((float)found / (float)total) : 0.0f;
 }
 
-/* Replace raw cosine scores with composite: cosine*w1 + length*w2 + keyword*w3. */
+static int is_definitional_query(const char *q)
+{
+    if (!q) return 0;
+    while (*q == ' ' || *q == '\t') q++;
+    char buf[64];
+    int i = 0;
+    while (i < 63 && q[i]) { buf[i] = (char)tolower((unsigned char)q[i]); i++; }
+    buf[i] = '\0';
+    int n             = g_nprefixes > 0 ? g_nprefixes
+                                        : (int)(sizeof(k_def_prefixes)/sizeof(k_def_prefixes[0]));
+    const char **list = g_nprefixes > 0 ? (const char **)g_prefixes : k_def_prefixes;
+    for (int p = 0; p < n; p++)
+        if (strncmp(buf, list[p], strlen(list[p])) == 0) return 1;
+    return 0;
+}
+
+static float definition_content_score(const char *text)
+{
+    if (!text) return 0.0f;
+    char buf[401];
+    int i = 0;
+    while (i < 400 && text[i]) { buf[i] = (char)tolower((unsigned char)text[i]); i++; }
+    buf[i] = '\0';
+    int n             = g_nmarkers > 0 ? g_nmarkers
+                                       : (int)(sizeof(k_def_markers)/sizeof(k_def_markers[0]));
+    const char **list = g_nmarkers > 0 ? (const char **)g_markers : k_def_markers;
+    int hits = 0;
+    for (int m = 0; m < n; m++)
+        if (strstr(buf, list[m])) hits++;
+    if (hits == 0) return 0.0f;
+    return 1.0f;
+}
+
+/* Replace raw cosine scores with composite: cosine*w1 + length*w2 + keyword*w3
+ * + definition_signal*w4 (when query is definitional and w4 > 0). */
 static void rerank_hits(QHit *hits, int nhits,
                         const char *query, const ScoreConfig *cfg)
 {
+    int is_def = (cfg->w4 > 0.0f) ? is_definitional_query(query) : 0;
     for (int i = 0; i < nhits; i++) {
         float cosine = hits[i].score;
         float lscore = hits[i].text
@@ -226,7 +330,11 @@ static void rerank_hits(QHit *hits, int nhits,
         float kscore = (hits[i].text && query)
                        ? keyword_density_score(query, hits[i].text)
                        : 0.0f;
-        hits[i].score = cosine * cfg->w1 + lscore * cfg->w2 + kscore * cfg->w3;
+        float dscore = (is_def && hits[i].text)
+                       ? definition_content_score(hits[i].text)
+                       : 0.0f;
+        hits[i].score = cosine * cfg->w1 + lscore * cfg->w2
+                      + kscore * cfg->w3 + dscore * cfg->w4;
     }
 }
 
@@ -515,6 +623,15 @@ static int init_engines(const char *ini)
         printf("porool: ve_init(%s): %s\n", vocab, ve_strerror(ve_last_error()));
         return -1;
     }
+
+    phrases_ensure(PHRASE_PREFIXES_LOGICAL, k_def_prefixes,
+                   (int)(sizeof(k_def_prefixes)/sizeof(k_def_prefixes[0])),
+                   DEFAULT_DATA_DIR);
+    phrases_ensure(PHRASE_MARKERS_LOGICAL,  k_def_markers,
+                   (int)(sizeof(k_def_markers)/sizeof(k_def_markers[0])),
+                   DEFAULT_DATA_DIR);
+    phrases_load(PHRASE_PREFIXES_LOGICAL, g_prefixes, &g_nprefixes);
+    phrases_load(PHRASE_MARKERS_LOGICAL,  g_markers,  &g_nmarkers);
     return 0;
 }
 
@@ -776,8 +893,10 @@ static int cmd_query(int argc, char **argv)
 {
     if (argc < 3) {
         fprintf(stderr,
-            "Usage: porool query <text> --db <db> --table <table|all>"
-            " [--topk N] [--max-chars N] [--ini <ini>] [--data-dir <dir>]\n");
+            "Usage: porool query <text> [--db <db>] [--table <table>]"
+            " [--topk N] [--max-chars N] [--ini <ini>] [--data-dir <dir>]\n"
+            "       Omit --table to search all tables in the db.\n"
+            "       Omit --db to search every table in data-dir.\n");
         return 1;
     }
 
@@ -794,14 +913,13 @@ static int cmd_query(int argc, char **argv)
         else if (!strcmp(argv[i], "--topk")      && i+1 < argc) topk     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-chars") && i+1 < argc) max_chars= atoi(argv[++i]);
     }
-    if (!table) table = "all";
     if (topk <= 0)      topk      = DEFAULT_TOPK;
     if (max_chars <= 0) max_chars = DEFAULT_MAX_CHARS;
 
-    /* Bare "all" with no db = search every table in data_dir */
-    int all_mode = (!db && !strcasecmp(table, "all"))
-                || ( db && !strcasecmp(db,    "all"))
-                || (!db);
+    int all_mode = !db
+                || (db    && !strcasecmp(db,    "all"))
+                || (table && !strcasecmp(table, "all"))
+                || !table;
 
     /* ── single table ── */
     if (!all_mode) {
@@ -1020,6 +1138,124 @@ static int cmd_peek(int argc, char **argv)
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ *  phrasing
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static int phrase_append(const char *logical, const char *pattern,
+                          const char *data_dir)
+{
+    tde_handle_t old   = tde_open_odat(logical);
+    int          old_n = old ? tde_row_count(old) : 0;
+
+    /* Duplicate check */
+    for (int i = 0; i < old_n; i++) {
+        int need = tde_get_string(old, i, 0, NULL, 0);
+        if (need <= 0) continue;
+        char *s = (char *)malloc((size_t)need);
+        if (!s) continue;
+        int dup = tde_get_string(old, i, 0, s, need) > 0
+                  && strcmp(s, pattern) == 0;
+        free(s);
+        if (dup) { if (old) tde_close(old); return -1; }
+    }
+
+    const char  *cols[] = { "pattern" };
+    tde_handle_t tbl    = tde_create(cols, 1);
+    if (!tbl) { if (old) tde_close(old); return -2; }
+
+    for (int i = 0; i < old_n; i++) {
+        int need = tde_get_string(old, i, 0, NULL, 0);
+        if (need <= 0) continue;
+        char *s = (char *)malloc((size_t)need);
+        if (!s) continue;
+        if (tde_get_string(old, i, 0, s, need) > 0) {
+            tde_handle_t row = tde_row_begin(tbl);
+            if (row) { tde_row_set_string(row, 0, s); tde_row_commit(row); }
+        }
+        free(s);
+    }
+    if (old) tde_close(old);
+
+    tde_handle_t row = tde_row_begin(tbl);
+    if (row) { tde_row_set_string(row, 0, pattern); tde_row_commit(row); }
+
+#ifdef _WIN32
+    { char p[512]; snprintf(p, sizeof(p), "%s", data_dir);        _mkdir(p); }
+    { char p[512]; snprintf(p, sizeof(p), "%s/phrasing", data_dir); _mkdir(p); }
+#else
+    { char p[512]; snprintf(p, sizeof(p), "%s", data_dir);        mkdir(p, 0755); }
+    { char p[512]; snprintf(p, sizeof(p), "%s/phrasing", data_dir); mkdir(p, 0755); }
+#endif
+    if (tde_save_logical(tbl, logical) != TDE_OK) { tde_close(tbl); return -2; }
+    tde_close(tbl);
+    return 0;
+}
+
+static int cmd_phrasing(int argc, char **argv)
+{
+    const char *action   = argc >= 3 ? argv[2] : "list";
+    const char *pattern  = argc >= 4 ? argv[3] : NULL;
+    const char *ini      = DEFAULT_INI;
+    const char *data_dir = DEFAULT_DATA_DIR;
+
+    for (int i = 3; i < argc; i++) {
+        if      (!strcmp(argv[i], "--ini")      && i+1 < argc) ini      = argv[++i];
+        else if (!strcmp(argv[i], "--data-dir") && i+1 < argc) data_dir = argv[++i];
+        else if (!strcmp(argv[i], "--pattern")  && i+1 < argc) pattern  = argv[++i];
+    }
+
+    if (tde_config_load(ini) != TDE_OK) {
+        fprintf(stderr, "porool: tde_config_load(%s) failed\n", ini);
+        return 1;
+    }
+
+    if (!strcmp(action, "list")) {
+        const char *tables[] = { PHRASE_PREFIXES_LOGICAL, PHRASE_MARKERS_LOGICAL };
+        const char *labels[] = { "query_prefixes", "chunk_markers" };
+        for (int t = 0; t < 2; t++) {
+            printf("[%s]\n", labels[t]);
+            tde_handle_t h = tde_open_odat(tables[t]);
+            if (!h) { printf("  (table not found)\n\n"); continue; }
+            int n = tde_row_count(h);
+            for (int i = 0; i < n; i++) {
+                int need = tde_get_string(h, i, 0, NULL, 0);
+                if (need <= 0) continue;
+                char *s = (char *)malloc((size_t)need);
+                if (!s) continue;
+                if (tde_get_string(h, i, 0, s, need) > 0)
+                    printf("  [%d] %s\n", i, s);
+                free(s);
+            }
+            tde_close(h);
+            printf("\n");
+        }
+        return 0;
+    }
+
+    if (!pattern) {
+        fprintf(stderr, "porool phrasing %s: pattern required as 3rd argument\n", action);
+        return 1;
+    }
+
+    const char *logical = NULL;
+    if      (!strcmp(action, "add-prefix")) logical = PHRASE_PREFIXES_LOGICAL;
+    else if (!strcmp(action, "add-marker")) logical = PHRASE_MARKERS_LOGICAL;
+    else {
+        fprintf(stderr, "porool phrasing: unknown action '%s'\n"
+                        "  Usage: porool phrasing list\n"
+                        "         porool phrasing add-prefix \"pattern\"\n"
+                        "         porool phrasing add-marker \"marker\"\n", action);
+        return 1;
+    }
+
+    int rc = phrase_append(logical, pattern, data_dir);
+    if      (rc == -1) { fprintf(stderr, "porool: duplicate — '%s' already exists\n", pattern); return 1; }
+    else if (rc == -2) { fprintf(stderr, "porool: failed to save phrasing table\n"); return 1; }
+    printf("porool: added '%s' to %s\n", pattern, logical);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  *  interactive wizard
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -1090,16 +1326,15 @@ static void cmd_interactive(void)
 
             char dbtbl[512];
             for (;;) {
-                if (!read_line("DB.Table (or 'all'): ", dbtbl, sizeof(dbtbl))) goto done;
+                if (!read_line("DB.Table (db / db.table / all): ", dbtbl, sizeof(dbtbl))) goto done;
                 if (dbtbl[0]) break;
                 printf("  (required)\n");
             }
             printf("\n");
 
-            char db[256] = "", table[256] = "";
+            char db[256] = "", table[256] = "all";
             if (!strcasecmp(dbtbl, "all")) {
-                strncpy(db,    "all", sizeof(db));
-                strncpy(table, "all", sizeof(table));
+                /* leave db="" table="all" → search everything */
             } else {
                 char *dot = strchr(dbtbl, '.');
                 if (dot && dot != dbtbl && *(dot+1)) {
@@ -1107,8 +1342,8 @@ static void cmd_interactive(void)
                     strncpy(db, dbtbl, dlen < 255 ? dlen : 255); db[dlen < 255 ? dlen : 255] = '\0';
                     strncpy(table, dot+1, 255);
                 } else {
-                    printf("  Enter db.table or 'all'\n\n");
-                    continue;
+                    /* bare db name — search all tables in that db */
+                    strncpy(db, dbtbl, 255); db[255] = '\0';
                 }
             }
 
@@ -1196,10 +1431,11 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (!strcmp(argv[1], "ingest")) return cmd_ingest(argc, argv);
-    if (!strcmp(argv[1], "query"))  return cmd_query (argc, argv);
-    if (!strcmp(argv[1], "stats"))  return cmd_stats (argc, argv);
-    if (!strcmp(argv[1], "peek"))   return cmd_peek  (argc, argv);
+    if (!strcmp(argv[1], "ingest"))   return cmd_ingest   (argc, argv);
+    if (!strcmp(argv[1], "query"))    return cmd_query    (argc, argv);
+    if (!strcmp(argv[1], "stats"))    return cmd_stats    (argc, argv);
+    if (!strcmp(argv[1], "peek"))     return cmd_peek     (argc, argv);
+    if (!strcmp(argv[1], "phrasing")) return cmd_phrasing (argc, argv);
 
     fprintf(stderr, "porool: unknown command '%s'\n\n", argv[1]);
     usage();
