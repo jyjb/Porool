@@ -10,15 +10,15 @@
  *   Similarity         — cosine similarity between any two token vectors
  *
  * Storage layout (all files created at runtime by sorkuvai):
- *   {db}.vocab.odat      columns: [token_id int32, word string, flags int32]
- *   {db}.vocab_vec.ovec  float vectors, row_id == token_id
+ *   {db}.ovoc            vocabulary hash table: word → token_id  (O(1) lookup)
+ *                        reverse index: token_id → word
+ *                        record layout: [token_id u32][key_len u16][flags u16]
+ *                                       [vector float*dim][word]
+ *                        flags: domain enum — see [vocab_flags] in INI
  *   {db}.tokenize.odat   optional: col 0 = delimiter char/sequence per row
  *
- * Note on .ovoc:
- *   tde_build_vocab / tde_vocab_lookup are not used. A confirmed bug in
- *   tharavu.dll causes the .ovoc hash table to be written with offsets that
- *   exceed the file size, returning TDE_ERR_CORRUPT on every lookup.
- *   Vocabulary is stored in .odat (full CRUD) instead.
+ * Example: ve_init("general.english", ...) uses
+ *   data/general/english.ovoc  (contains word + token_id + flag + dense vector)
  *
  * ── Memory ownership ──────────────────────────────────────────────────────
  *   Buffers returned by ve_tokenize / ve_process_text MUST be released with
@@ -212,6 +212,46 @@ SK_API int      SK_CALL sk_get_dim(void);
 
 /* Number of words currently in the vocabulary.                              */
 SK_API uint32_t SK_CALL sk_vocab_size(void);
+
+/* ── Per-token domain flags ──────────────────────────────────────────────── */
+
+/* Domain flag bitmask constants — each bit = one domain.
+ * A token may belong to multiple domains: chemistry|physics = 0x0005.
+ * These are compile-time defaults; runtime values come from [vocab_flags]
+ * in the INI.  Use ve_flag_id() to resolve a name to its bitmask value.
+ * Add new domains in the INI as the next unused power of two.               */
+#define SK_FLAG_GENERAL    0x0000u   /* no domain (unclassified)             */
+#define SK_FLAG_CHEMISTRY  0x0001u   /* bit 0                                */
+#define SK_FLAG_LEGAL      0x0002u   /* bit 1                                */
+#define SK_FLAG_PHYSICS    0x0004u   /* bit 2                                */
+/* next free: 0x0008 (bit 3) */
+
+/* Test whether a combined flag value includes a specific domain bit.        */
+#define SK_FLAG_HAS(combined, flag)  (((combined) & (flag)) != 0)
+
+/* Resolve a domain name → bitmask value as loaded from the INI.
+ * Returns the uint16 bitmask, or -1 if the name is not registered.
+ * Example: ve_flag_id("chemistry") → 0x0001                                */
+SK_API int SK_CALL ve_flag_id(const char *name);
+
+/* Set multiple domain flags on a token (OR'd into one uint16 bitmask).
+ * Example: uint16_t f[] = {SK_FLAG_CHEMISTRY, SK_FLAG_PHYSICS};
+ *          ve_set_word_flags(id, f, 2);  → stores 0x0005                   */
+SK_API int SK_CALL ve_set_word_flags(uint32_t token_id, const uint16_t *flags, int count);
+
+/* Expand the combined bitmask back into a list of domain flag values.
+ * buf receives up to max flag values; *out_count is set to actual count.    */
+SK_API int SK_CALL ve_get_word_flags(uint32_t token_id, uint16_t *buf, int max, int *out_count);
+
+/* Returns 1 if the token has the given domain flag set, 0 if not.          */
+SK_API int SK_CALL ve_word_has_flag(uint32_t token_id, uint16_t flag);
+
+/* Set the raw combined bitmask directly.
+ * Returns VE_OK or VE_ERR_NOTFOUND / VE_ERR_STATE.                         */
+SK_API int SK_CALL ve_set_word_flag(uint32_t token_id, uint16_t flag);
+
+/* Get the raw combined bitmask for a token.                                 */
+SK_API int SK_CALL ve_get_word_flag(uint32_t token_id, uint16_t *out_flag);
 
 /* ── Logging ─────────────────────────────────────────────────────────────── */
 

@@ -76,11 +76,10 @@ $(DLL): scr/porool.c include/porool.h include/porool_extract.h \
 	    -o $@ scr/porool.c $(EXTRACT_OBJ_DLL) \
 	    $(LDSK) -lz -lm
 
-# Build the CLI
-$(CLI): scr/porool_cli.c include/tharavu_dll.h include/sorkuvai_dll.h \
-        include/porool_extract.h $(EXTRACT_OBJ_CLI) | bin
-	$(CC) $(CFLAGS) -o $@ scr/porool_cli.c $(EXTRACT_OBJ_CLI) \
-	    $(LDSK) -lz -lm
+# Build the CLI (thin wrapper — links against porool.dll + tharavu_dll for stats/peek)
+$(CLI): scr/porool_cli.c include/porool.h include/tharavu_dll.h $(DLL) | bin
+	$(CC) $(CFLAGS) -o $@ scr/porool_cli.c \
+	    -Llib -lporool -L$(SK_LIB) -ltharavu_dll -lm
 
 # Build and run the full test suite
 test: $(TEST)

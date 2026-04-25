@@ -228,6 +228,15 @@ THARAVU_API const char *THARAVU_CALL tde_vocab_reverse_lookup(tde_handle_t h,
                                                                uint32_t     token_id,
                                                                uint16_t    *out_len);
 
+/* Extended reverse lookup: also returns per-token flags and a zero-copy
+ * pointer to the embedded float vector (NULL when dim == 0).
+ * out_len, out_flags, out_vec are all optional (may be NULL).              */
+THARAVU_API const char *THARAVU_CALL tde_vocab_reverse_lookup_ex(tde_handle_t   h,
+                                                                   uint32_t       token_id,
+                                                                   uint16_t      *out_len,
+                                                                   uint16_t      *out_flags,
+                                                                   const float  **out_vec);
+
 /* Bulk token → word (zero-copy).  words_out[i] = mmap pointer or NULL.
  * Returns number resolved, or negative error code.                         */
 THARAVU_API int THARAVU_CALL tde_vocab_reverse_batch(tde_handle_t     h,
@@ -286,12 +295,23 @@ THARAVU_API int THARAVU_CALL tde_vector_search_topk(tde_handle_t  h,
 
 /* Build a vocabulary (.ovoc) file from an array of words.
  * words[0..count-1] are null-terminated strings; token IDs == array index.
+ * vectors: flat row-major float[count * dim] embedding per token, or NULL.
+ * dim: embedding dimension; 0 means no embedded vectors.
+ * flags: per-token uint16 flags array, or NULL (all tokens get flags=0).
  * Returns TDE_OK or a negative error code.                                 */
-THARAVU_API int THARAVU_CALL tde_build_vocab(const char *filepath,
-                                              const char **words, int count);
+THARAVU_API int THARAVU_CALL tde_build_vocab(const char     *filepath,
+                                              const char    **words,
+                                              int             count,
+                                              const float    *vectors,
+                                              uint32_t        dim,
+                                              const uint16_t *flags);
 
-THARAVU_API int THARAVU_CALL tde_build_vocab_logical(const char *logical_name,
-                                                      const char **words, int count);
+THARAVU_API int THARAVU_CALL tde_build_vocab_logical(const char     *logical_name,
+                                                      const char    **words,
+                                                      int             count,
+                                                      const float    *vectors,
+                                                      uint32_t        dim,
+                                                      const uint16_t *flags);
 
 /* Build a vector file (.ovec) from a FLAT row-major float array.
  * data points to count * dim floats laid out as:

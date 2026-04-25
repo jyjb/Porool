@@ -93,7 +93,7 @@ typedef struct {
     float optimal_chunk_len;
     float length_penalty_sigma;
     float default_source_weight;
-    float w1, w2, w3, w4;
+    float w1, w2, w3, w4, w5;
     source_weight_t source_weights[MAX_SOURCE_WEIGHTS];
     int             source_weight_count;
 } PoroolConfig;
@@ -175,6 +175,7 @@ static void write_default_ini(const char *path)
         "w2 = 0.20\n"
         "w3 = 0.20\n"
         "w4 = 0.15\n"
+        "w5 = 0.20\n"
         "\n"
         "[source_weights]\n"
         "; Per-source priority multipliers.  Range [0.0, 2.0]; values outside are clamped.\n"
@@ -211,7 +212,7 @@ static int load_config(const char *path)
     g_cfg.optimal_chunk_len     = 500.0f;
     g_cfg.length_penalty_sigma  = 200.0f;
     g_cfg.default_source_weight = 1.0f;
-    g_cfg.w1 = 0.6f; g_cfg.w2 = 0.2f; g_cfg.w3 = 0.2f; g_cfg.w4 = 0.0f;
+    g_cfg.w1 = 0.6f; g_cfg.w2 = 0.2f; g_cfg.w3 = 0.2f; g_cfg.w4 = 0.15f; g_cfg.w5 = 0.20f;
     g_cfg.source_weight_count   = 0;
 
     FILE *fp = fopen(path, "r");
@@ -271,6 +272,7 @@ static int load_config(const char *path)
             else if (!strcmp(key, "w2")) g_cfg.w2 = (float)strtod(val, NULL);
             else if (!strcmp(key, "w3")) g_cfg.w3 = (float)strtod(val, NULL);
             else if (!strcmp(key, "w4")) g_cfg.w4 = (float)strtod(val, NULL);
+            else if (!strcmp(key, "w5")) g_cfg.w5 = (float)strtod(val, NULL);
         } else if (strcmp(section, "source_weights") == 0) {
             if (g_cfg.source_weight_count < MAX_SOURCE_WEIGHTS) {
                 source_weight_t *sw = &g_cfg.source_weights[g_cfg.source_weight_count++];
@@ -354,13 +356,12 @@ POROOL_API int porool_init(const char *config_path)
     /* 2. Init Sorkuvai vocabulary engine (inherits tharavu config via NULL) */
     if (ve_init(g_cfg.vocab_name, NULL) != VE_OK) return -4;
 
-    /* 3. Open chunk text/source table (RAM-loaded ODAT) */
-    g_chunks = tde_open_odat(g_cfg.chunks_table);
-    if (!g_chunks) return -5;
-
-    /* 4. Open vector store (mmap .ovec) */
-    g_vectors = tde_open_ovec(g_cfg.vectors_table);
-    if (!g_vectors) { tde_close(g_chunks); g_chunks = NULL; return -6; }
+    /* 3+4. Open default chunk/vector tables — non-fatal if absent.
+     * porool_retrieve() returns NULL when these are NULL; the multi-table
+     * porool_retrieve_from/porool_retrieve_target open their own handles
+     * per-call and are unaffected. */
+    g_chunks  = tde_open_odat(g_cfg.chunks_table);
+    g_vectors = g_chunks ? tde_open_ovec(g_cfg.vectors_table) : NULL;
 
     /* 5. Ensure phrasing tables exist then load into cache */
     phrases_ensure(PHRASE_PREFIXES_LOGICAL, k_def_prefixes,
@@ -383,6 +384,117 @@ POROOL_API void porool_shutdown(void)
     g_ready = 0;
 }
 
+/* ── Utility: case-insensitive substring search ──────────────────────────────*/
+
+/* needle must already be lowercased. */
+static int ci_contains(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !needle[0]) return 0;
+    size_t nl = strlen(needle);
+    for (; *haystack; haystack++) {
+        size_t k = 0;
+        while (k < nl && haystack[k] &&
+               tolower((unsigned char)haystack[k]) == (unsigned char)needle[k])
+            k++;
+        if (k == nl) return 1;
+    }
+    return 0;
+}
+
+/* ── Synonym expansion ───────────────────────────────────────────────────────*/
+
+#define MAX_SYNONYMS 96
+
+typedef struct { char from[64]; char to[128]; } SynPair;
+
+static SynPair g_synonyms[MAX_SYNONYMS];
+static int     g_n_synonyms = 0;
+
+static const char k_def_synonyms[][2][64] = {
+    {"cancel",       "terminate"},
+    {"cancellation", "termination"},
+    {"end",          "terminate"},
+    {"break",        "breach"},
+    {"violate",      "breach"},
+    {"code",         "work product"},
+    {"software",     "work product"},
+    {"work",         "work product"},
+    {"pay",          "payment"},
+    {"price",        "fee"},
+    {"cost",         "fee"},
+    {"hire",         "engage"},
+    {"buy",          "purchase"},
+    {"own",          "ownership"},
+    {"owns",         "assigns"},
+    {"own",          "assigns"},
+    {"developed",    "created"},
+    {"built",        "created"},
+    {"wrote",        "created"},
+    {"fired",        "terminated"},
+    {"dispute",      "arbitration"},
+    {"sue",          "arbitration"},
+    {"deadline",     "notice"},
+};
+#define N_DEF_SYNONYMS ((int)(sizeof(k_def_synonyms)/sizeof(k_def_synonyms[0])))
+
+static void synonyms_ensure_defaults(void)
+{
+    if (g_n_synonyms > 0) return;
+    for (int i = 0; i < N_DEF_SYNONYMS && g_n_synonyms < MAX_SYNONYMS; i++) {
+        snprintf(g_synonyms[g_n_synonyms].from, 64,  "%.63s",  k_def_synonyms[i][0]);
+        snprintf(g_synonyms[g_n_synonyms].to,   128, "%.127s", k_def_synonyms[i][1]);
+        g_n_synonyms++;
+    }
+}
+
+/* Returns heap-allocated expanded query with synonym terms appended.
+ * e.g. "how to cancel the agreement" → "…terminate"
+ * Caller must free(). Returns NULL only on OOM. */
+static char *synonym_expand(const char *query)
+{
+    if (!query) return NULL;
+    synonyms_ensure_defaults();
+    size_t ql  = strlen(query);
+    size_t cap = ql + (size_t)g_n_synonyms * 130 + 4;
+    char *out  = (char *)malloc(cap);
+    if (!out) return NULL;
+    memcpy(out, query, ql + 1);
+    size_t used = ql;
+    for (int s = 0; s < g_n_synonyms; s++) {
+        const char *from = g_synonyms[s].from;
+        const char *to   = g_synonyms[s].to;
+        if (!from[0] || !to[0]) continue;
+        if (ci_contains(query, to)) continue;
+        size_t fl  = strlen(from);
+        const char *p = query;
+        int hit = 0;
+        while (*p && !hit) {
+            if (tolower((unsigned char)*p) == (unsigned char)from[0]) {
+                size_t k = 0;
+                while (k < fl && p[k] &&
+                       tolower((unsigned char)p[k]) == (unsigned char)from[k])
+                    k++;
+                if (k == fl) {
+                    unsigned char pre  = (p > query) ? (unsigned char)p[-1] : 0;
+                    unsigned char post = (unsigned char)p[fl];
+                    if (!isalnum(pre) && !isalnum(post)) hit = 1;
+                }
+            }
+            if (!hit) p++;
+        }
+        if (hit) {
+            size_t tl = strlen(to);
+            if (used + 1 + tl < cap) {
+                out[used++] = ' ';
+                memcpy(out + used, to, tl);
+                used += tl;
+                out[used] = '\0';
+            }
+        }
+    }
+    return out;
+}
+
 /* ── Embedding (Sorkuvai) ────────────────────────────────────────────────────*/
 
 /*
@@ -396,12 +508,17 @@ POROOL_API int porool_embed_query(const char *query, float **embedding, int *dim
     *embedding = NULL; *dim = 0;
     if (!g_ready) return -1;
 
+    char *expanded = synonym_expand(query);
+    const char *q  = expanded ? expanded : query;
+
     uint32_t *ids  = NULL;
     int       n    = 0;
-    if (ve_process_text(query, &ids, &n) != VE_OK || n == 0) {
+    if (ve_process_text(q, &ids, &n) != VE_OK || n == 0) {
         ve_free_ids(ids);
+        free(expanded);
         return -1;
     }
+    free(expanded);
 
     int d = sk_get_dim();
     float *emb = (float *)calloc((size_t)d, sizeof(float));
@@ -444,10 +561,49 @@ static char *fetch_string(tde_handle_t h, int row, int col)
     return buf;
 }
 
+/* col indices in the chunks ODAT */
+#define COL_TEXT             0
+#define COL_SOURCE           1
+#define COL_CHUNK_ID         2
+#define COL_CONCEPT          3
+#define COL_SECTION          4
+#define COL_TYPE             5
+#define COL_TAGS             6
+#define COL_IMPORTANCE       7
+#define COL_RELATED_CONCEPTS 8
+#define ODAT_NCOLS           9
+
+static void fill_result_meta(SearchResult *r, tde_handle_t h, int row)
+{
+    r->text             = fetch_string(h, row, COL_TEXT);
+    r->source           = fetch_string(h, row, COL_SOURCE);
+    r->chunk_id         = fetch_string(h, row, COL_CHUNK_ID);
+    r->concept          = fetch_string(h, row, COL_CONCEPT);
+    r->section          = fetch_string(h, row, COL_SECTION);
+    r->type             = fetch_string(h, row, COL_TYPE);
+    r->tags             = fetch_string(h, row, COL_TAGS);
+    r->importance       = fetch_string(h, row, COL_IMPORTANCE);
+    r->related_concepts = fetch_string(h, row, COL_RELATED_CONCEPTS);
+}
+
+static void free_result_fields(SearchResult *r)
+{
+    free(r->text);
+    free(r->source);
+    free(r->chunk_id);
+    free(r->concept);
+    free(r->section);
+    free(r->type);
+    free(r->tags);
+    free(r->importance);
+    free(r->related_concepts);
+}
+
 POROOL_API SearchResult *porool_retrieve(float *query_vector, int top_k,
                                           int   *result_count)
 {
     if (!query_vector || top_k <= 0 || !result_count || !g_ready) return NULL;
+    if (!g_vectors || !g_chunks) return NULL;
     *result_count = 0;
 
     int d = sk_get_dim();
@@ -464,11 +620,9 @@ POROOL_API SearchResult *porool_retrieve(float *query_vector, int top_k,
     if (!res) { free(ids); free(scores); return NULL; }
 
     for (int i = 0; i < found; i++) {
-        res[i].id     = ids[i];
-        res[i].score  = scores[i];
-        /* chunks table: col 0 = text, col 1 = source (row == vector store row) */
-        res[i].text   = fetch_string(g_chunks, (int)ids[i], 0);
-        res[i].source = fetch_string(g_chunks, (int)ids[i], 1);
+        res[i].id    = ids[i];
+        res[i].score = scores[i];
+        fill_result_meta(&res[i], g_chunks, (int)ids[i]);
     }
 
     free(ids);
@@ -488,15 +642,23 @@ static float source_weight_lookup(const char *source)
     return g_cfg.default_source_weight;
 }
 
+static float importance_score(const char *imp)
+{
+    if (!imp || imp[0] == '\0') return 0.5f;
+    if (strcmp(imp, "high")   == 0) return 1.0f;
+    if (strcmp(imp, "medium") == 0) return 0.5f;
+    if (strcmp(imp, "low")    == 0) return 0.2f;
+    return 0.5f;
+}
+
 static float length_score(const char *text)
 {
     if (!text) return 0.0f;
-    float len = (float)strlen(text);
+    float len   = (float)strlen(text);
     float sigma = g_cfg.length_penalty_sigma > 0.0f
                   ? g_cfg.length_penalty_sigma : 1.0f;
-    float dev = fabsf(len - g_cfg.optimal_chunk_len) / sigma;
-    float s   = 1.0f - dev * 0.85f;
-    return s < 0.1f ? 0.1f : s;
+    float dev = (len - g_cfg.optimal_chunk_len) / sigma;
+    return expf(-0.5f * dev * dev);
 }
 
 static int cmp_results_desc(const void *a, const void *b)
@@ -506,20 +668,36 @@ static int cmp_results_desc(const void *a, const void *b)
     return (sa > sb) ? -1 : (sa < sb) ? 1 : 0;
 }
 
-/* Returns 1 if the query is a definitional intent ("what is X?", "define X", etc.) */
-static int is_definitional_query(const char *q)
+/* Returns 1 if the query has a definitional prefix ("what is", "define", etc.)
+ * and writes the topic term — everything after the prefix, lowercased, '?' stripped —
+ * into out[0..out_sz-1].  Used to gate the w4 bonus so off-topic chunks
+ * with incidental "is a / is an" phrasing don't outrank on-topic results. */
+static int extract_query_topic(const char *q, char *out, int out_sz)
 {
-    if (!q) return 0;
+    if (!q || !out || out_sz <= 0) return 0;
+    out[0] = '\0';
     while (*q == ' ' || *q == '\t') q++;
-    char buf[64];
+    char buf[512];
     int i = 0;
-    while (i < 63 && q[i]) { buf[i] = (char)tolower((unsigned char)q[i]); i++; }
+    while (i < (int)sizeof(buf) - 1 && q[i]) {
+        buf[i] = (char)tolower((unsigned char)q[i]); i++;
+    }
     buf[i] = '\0';
-    int n          = g_nprefixes > 0 ? g_nprefixes
-                                     : (int)(sizeof(k_def_prefixes)/sizeof(k_def_prefixes[0]));
+    int n = g_nprefixes > 0 ? g_nprefixes
+                            : (int)(sizeof(k_def_prefixes)/sizeof(k_def_prefixes[0]));
     const char **list = g_nprefixes > 0 ? (const char **)g_prefixes : k_def_prefixes;
-    for (int p = 0; p < n; p++)
-        if (strncmp(buf, list[p], strlen(list[p])) == 0) return 1;
+    for (int p = 0; p < n; p++) {
+        size_t pl = strlen(list[p]);
+        if (strncmp(buf, list[p], pl) != 0) continue;
+        const char *rest = buf + pl;
+        while (*rest == ' ') rest++;
+        int rlen = (int)strlen(rest);
+        while (rlen > 0 && (rest[rlen-1] == '?' || rest[rlen-1] == ' ')) rlen--;
+        int copy = rlen < out_sz - 1 ? rlen : out_sz - 1;
+        memcpy(out, rest, (size_t)copy);
+        out[copy] = '\0';
+        return out[0] != '\0' ? 1 : 0;
+    }
     return 0;
 }
 
@@ -541,20 +719,73 @@ static float definition_content_score(const char *text)
     return 1.0f;
 }
 
+static int is_stopword(const char *w)
+{
+    static const char *s[] = {
+        "the","and","for","are","was","is","in","to","of","a","an","or",
+        "this","that","with","by","from","who","how","what","when","where",
+        "why","which","can","not","all","any","its","may","if","be","as",
+        NULL
+    };
+    for (int i = 0; s[i]; i++) if (strcmp(w, s[i]) == 0) return 1;
+    return 0;
+}
+
+/* Fraction of distinct non-stopword query words (>2 chars) found in chunk text.
+ * Uses synonym-expanded query so "work product" and "assigns" count as hits. */
+static float term_overlap_score(const char *query, const char *text)
+{
+    if (!query || !text) return 0.0f;
+    char qbuf[4096]; int i = 0;
+    while (i < (int)sizeof(qbuf)-1 && query[i])
+        { qbuf[i] = (char)tolower((unsigned char)query[i]); i++; }
+    qbuf[i] = '\0';
+    char tbuf[8192]; i = 0;
+    while (i < (int)sizeof(tbuf)-1 && text[i])
+        { tbuf[i] = (char)tolower((unsigned char)text[i]); i++; }
+    tbuf[i] = '\0';
+    int total = 0, found = 0;
+    char *tok = strtok(qbuf, " \t\n\r.,;:!?\"'()[]{}");
+    while (tok) {
+        if (strlen(tok) > 2 && !is_stopword(tok)) {
+            total++;
+            if (strstr(tbuf, tok)) found++;
+        }
+        tok = strtok(NULL, " \t\n\r.,;:!?\"'()[]{}");
+    }
+    return (total > 0) ? ((float)found / (float)total) : 0.0f;
+}
+
 /* Like porool_rerank but incorporates query intent when w4 > 0. Used internally. */
 static void rerank_internal(SearchResult *results, int count, const char *query)
 {
     if (!results || count <= 0) return;
-    float w1 = g_cfg.w1, w2 = g_cfg.w2, w3 = g_cfg.w3, w4 = g_cfg.w4;
-    int is_def = (w4 > 0.0f) ? is_definitional_query(query) : 0;
+    float w1 = g_cfg.w1, w2 = g_cfg.w2, w3 = g_cfg.w3, w4 = g_cfg.w4, w5 = g_cfg.w5;
+    char topic[256] = "";
+    int is_def = (w4 > 0.0f) ? extract_query_topic(query, topic, sizeof(topic)) : 0;
+    char *expanded = (w5 > 0.0f) ? synonym_expand(query) : NULL;
+    const char *eq  = expanded ? expanded : query;
     for (int i = 0; i < count; i++) {
         float cosine = results[i].score;
         float lscore = length_score(results[i].text);
-        float wsrc   = source_weight_lookup(results[i].source);
-        float sscore = wsrc > 2.0f ? 1.0f : wsrc * 0.5f;
-        float dscore = is_def ? definition_content_score(results[i].text) : 0.0f;
-        results[i].score = cosine * w1 + lscore * w2 + sscore * w3 + dscore * w4;
+        float sscore;
+        const char *imp = results[i].importance;
+        if (imp && imp[0] != '\0') {
+            sscore = importance_score(imp);
+        } else {
+            float wsrc = source_weight_lookup(results[i].source);
+            sscore = wsrc > 2.0f ? 1.0f : wsrc * 0.5f;
+        }
+        /* Definitional bonus only fires when the chunk actually mentions the
+         * topic term — prevents off-topic chunks with incidental "is a / is an"
+         * phrasing from outranking on-topic results. */
+        float dscore = (is_def && ci_contains(results[i].text, topic))
+                       ? definition_content_score(results[i].text) : 0.0f;
+        float oscore = (w5 > 0.0f)
+                       ? term_overlap_score(eq, results[i].text) : 0.0f;
+        results[i].score = cosine*w1 + lscore*w2 + sscore*w3 + dscore*w4 + oscore*w5;
     }
+    free(expanded);
     qsort(results, (size_t)count, sizeof(SearchResult), cmp_results_desc);
 }
 
@@ -572,6 +803,12 @@ POROOL_API void porool_rerank(SearchResult *results, int count)
         results[i].score = cosine * w1 + lscore * w2 + sscore * w3;
     }
     qsort(results, (size_t)count, sizeof(SearchResult), cmp_results_desc);
+}
+
+POROOL_API void porool_rerank_query(SearchResult *results, int count,
+                                     const char *query)
+{
+    rerank_internal(results, count, query);
 }
 
 /* ── Context builder ─────────────────────────────────────────────────────────*/
@@ -647,82 +884,85 @@ POROOL_API char *porool_query(const char *query, int top_k, int max_chars)
     return ctx;
 }
 
-/* ── Table registry ──────────────────────────────────────────────────────────*/
+/* ── Table discovery (folder = db, *.odat files inside = tables) ────────────*/
 
-/* Entry format: "db.table\n" — one per line, no duplicates. */
-
-static void registry_add(const char *db, const char *table)
-{
-    char path[640], entry[320];
-    snprintf(path,  sizeof(path),  "%s/%s.tables", g_cfg.data_dir, db);
-    snprintf(entry, sizeof(entry), "%s.%s",         db, table);
-
-    FILE *fp = fopen(path, "r");
-    if (fp) {
-        char line[320];
-        while (fgets(line, sizeof(line), fp)) {
-            line[strcspn(line, "\r\n")] = '\0';
-            if (strcmp(line, entry) == 0) { fclose(fp); return; }
-        }
-        fclose(fp);
-    }
-    fp = fopen(path, "a");
-    if (fp) { fprintf(fp, "%s\n", entry); fclose(fp); }
-}
-
-/* Returns the number of logical names read (each is "db.table"). */
+/* Scan data_dir/db/ for *.odat files; fill out[] with "db.tablename" entries.
+ * Returns count. */
 static int registry_read(const char *db, char out[][256], int max_out)
-{
-    char path[640];
-    snprintf(path, sizeof(path), "%s/%s.tables", g_cfg.data_dir, db);
-    FILE *fp = fopen(path, "r");
-    if (!fp) return 0;
-    int n = 0;
-    while (n < max_out && fgets(out[n], 256, fp)) {
-        out[n][strcspn(out[n], "\r\n")] = '\0';
-        if (out[n][0]) n++;
-    }
-    fclose(fp);
-    return n;
-}
-
-/* Scan data_dir for *.tables files and collect every "db.table" entry.
- * Returns total count. */
-static int registry_read_all(char out[][256], int max_out)
 {
     int n = 0;
 #ifdef _WIN32
     char pat[640];
-    snprintf(pat, sizeof(pat), "%s/*.tables", g_cfg.data_dir);
+    snprintf(pat, sizeof(pat), "%s/%s/*.odat", g_cfg.data_dir, db);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
-        char *fn = fd.cFileName;
+        const char *fn = fd.cFileName;
         int fl = (int)strlen(fn);
-        if (fl <= 7) continue; /* ".tables" = 7 chars */
-        char db[256];
-        int dl = fl - 7;
-        if (dl >= (int)sizeof(db)) continue;
-        memcpy(db, fn, (size_t)dl); db[dl] = '\0';
-        n += registry_read(db, out + n, max_out - n);
-    } while (n < max_out && FindNextFileA(h, &fd));
+        if (fl <= 5) continue;          /* ".odat" = 5 chars */
+        if (n >= max_out) break;
+        snprintf(out[n], 256, "%s.%.*s", db, fl - 5, fn);
+        n++;
+    } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
     char pat[640];
-    snprintf(pat, sizeof(pat), "%s/*.tables", g_cfg.data_dir);
+    snprintf(pat, sizeof(pat), "%s/%s/*.odat", g_cfg.data_dir, db);
     glob_t g = {0};
     if (glob(pat, 0, NULL, &g) == 0) {
         for (size_t i = 0; i < g.gl_pathc && n < max_out; i++) {
             const char *base = strrchr(g.gl_pathv[i], '/');
             base = base ? base + 1 : g.gl_pathv[i];
             int bl = (int)strlen(base);
-            if (bl <= 7) continue;
+            if (bl <= 5) continue;
+            snprintf(out[n], 256, "%s.%.*s", db, bl - 5, base);
+            n++;
+        }
+        globfree(&g);
+    }
+#endif
+    return n;
+}
+
+/* Scan all subdirectories of data_dir; for each subdir (= db), scan *.odat.
+ * Returns total count. */
+static int registry_read_all(char out[][256], int max_out)
+{
+    int n = 0;
+#ifdef _WIN32
+    char pat[640];
+    snprintf(pat, sizeof(pat), "%s/*", g_cfg.data_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == '.') continue;
+        n += registry_read(fd.cFileName, out + n, max_out - n);
+    } while (n < max_out && FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    char pat[640];
+    snprintf(pat, sizeof(pat), "%s/*/*.odat", g_cfg.data_dir);
+    glob_t g = {0};
+    if (glob(pat, 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc && n < max_out; i++) {
+            const char *path = g.gl_pathv[i];
+            const char *slash = strrchr(path, '/');
+            if (!slash) continue;
+            const char *base = slash + 1;
+            int bl = (int)strlen(base);
+            if (bl <= 5) continue;
+            const char *slash2 = slash - 1;
+            while (slash2 > path && *slash2 != '/') slash2--;
+            if (*slash2 == '/') slash2++;
+            int dl = (int)(slash - slash2);
+            if (dl <= 0 || dl >= 256) continue;
             char db[256];
-            int dl = bl - 7;
-            if (dl >= (int)sizeof(db)) continue;
-            memcpy(db, base, (size_t)dl); db[dl] = '\0';
-            n += registry_read(db, out + n, max_out - n);
+            memcpy(db, slash2, (size_t)dl); db[dl] = '\0';
+            snprintf(out[n], 256, "%s.%.*s", db, bl - 5, base);
+            n++;
         }
         globfree(&g);
     }
@@ -752,7 +992,7 @@ static int parse_target(const char *target, char *db_out, int db_sz,
 /* ── Ingest helpers ──────────────────────────────────────────────────────────*/
 
 #define POROOL_CHUNK_CHARS   500
-#define POROOL_CHUNK_OVERLAP 50
+#define POROOL_CHUNK_OVERLAP 150
 
 static void p_normalize(char *s)
 {
@@ -843,12 +1083,13 @@ static float *p_embed_chunk(const char *text)
 
 /* ── Ingest ──────────────────────────────────────────────────────────────────*/
 
-POROOL_API int porool_ingest(const char *file_path,
-                              const char *db, const char *table)
+POROOL_API int porool_ingest_with_meta(const char *file_path,
+                                        const char *db, const char *table,
+                                        const ChunkMeta *meta)
 {
     if (!file_path || !db || !table || !g_ready) return -1;
 
-    /* 1. Extract plain text (built-in: no external tools required) */
+    /* 1. Extract plain text */
     char *raw = porool_extract(file_path);
     if (!raw) return -2;
 
@@ -862,42 +1103,77 @@ POROOL_API int porool_ingest(const char *file_path,
 
     ensure_db_subdir(g_cfg.data_dir, db);
 
-    char cl[256], vl[256];
-    snprintf(cl, sizeof(cl), "%s.%s",     db, table);
-    snprintf(vl, sizeof(vl), "%s.%s_vec", db, table);
+    char cl[256];
+    snprintf(cl, sizeof(cl), "%s.%s", db, table);
     int d = sk_get_dim();
 
     /* 3. Load existing rows for append support */
     tde_handle_t old_tbl = tde_open_odat(cl);
     int old_n = old_tbl ? tde_row_count(old_tbl) : 0;
 
+    /* Deduplication: skip if file_path is already present in this table */
+    if (old_tbl) {
+        for (int i = 0; i < old_n; i++) {
+            char *src = fetch_string(old_tbl, i, COL_SOURCE);
+            int dup = src && strcmp(src, file_path) == 0;
+            free(src);
+            if (dup) {
+                tde_close(old_tbl);
+                p_free_chunks(chunks, nc);
+                return 1;
+            }
+        }
+    }
+
     /* 4. Build new ODAT: existing rows + new chunks */
-    const char *cols[] = { "text", "source" };
-    tde_handle_t new_tbl = tde_create(cols, 2);
+    const char *cols[] = {
+        "text", "source", "chunk_id",
+        "concept", "section", "type",
+        "tags", "importance", "related_concepts"
+    };
+    tde_handle_t new_tbl = tde_create(cols, ODAT_NCOLS);
     if (!new_tbl) {
         if (old_tbl) tde_close(old_tbl);
         p_free_chunks(chunks, nc);
         return -5;
     }
 
+    /* Copy existing rows (older tables may have fewer cols — fetch returns NULL safely) */
     for (int i = 0; i < old_n; i++) {
-        char *txt = fetch_string(old_tbl, i, 0);
-        char *src = fetch_string(old_tbl, i, 1);
+        char *f[ODAT_NCOLS];
+        for (int c = 0; c < ODAT_NCOLS; c++) f[c] = fetch_string(old_tbl, i, c);
         tde_handle_t row = tde_row_begin(new_tbl);
         if (row) {
-            tde_row_set_string(row, 0, txt ? txt : "");
-            tde_row_set_string(row, 1, src ? src : "");
+            for (int c = 0; c < ODAT_NCOLS; c++)
+                tde_row_set_string(row, c, f[c] ? f[c] : "");
             tde_row_commit(row);
         }
-        free(txt); free(src);
+        for (int c = 0; c < ODAT_NCOLS; c++) free(f[c]);
     }
     if (old_tbl) { tde_close(old_tbl); old_tbl = NULL; }
 
+    /* Meta field helpers — empty string when not provided */
+    const char *m_concept  = (meta && meta->concept)          ? meta->concept          : "";
+    const char *m_section  = (meta && meta->section)          ? meta->section          : "";
+    const char *m_type     = (meta && meta->type)             ? meta->type             : "";
+    const char *m_tags     = (meta && meta->tags)             ? meta->tags             : "";
+    const char *m_imp      = (meta && meta->importance)       ? meta->importance       : "";
+    const char *m_related  = (meta && meta->related_concepts) ? meta->related_concepts : "";
+
     for (int i = 0; i < nc; i++) {
+        char chunk_id[128];
+        snprintf(chunk_id, sizeof(chunk_id), "%s_%s_%04d", db, table, old_n + i);
         tde_handle_t row = tde_row_begin(new_tbl);
         if (row) {
-            tde_row_set_string(row, 0, chunks[i]);
-            tde_row_set_string(row, 1, file_path);
+            tde_row_set_string(row, COL_TEXT,             chunks[i]);
+            tde_row_set_string(row, COL_SOURCE,           file_path);
+            tde_row_set_string(row, COL_CHUNK_ID,         chunk_id);
+            tde_row_set_string(row, COL_CONCEPT,          m_concept);
+            tde_row_set_string(row, COL_SECTION,          m_section);
+            tde_row_set_string(row, COL_TYPE,             m_type);
+            tde_row_set_string(row, COL_TAGS,             m_tags);
+            tde_row_set_string(row, COL_IMPORTANCE,       m_imp);
+            tde_row_set_string(row, COL_RELATED_CONCEPTS, m_related);
             tde_row_commit(row);
         }
     }
@@ -915,7 +1191,7 @@ POROOL_API int porool_ingest(const char *file_path,
     if (!vecs) { p_free_chunks(chunks, nc); return -7; }
 
     if (old_n > 0) {
-        tde_handle_t old_ov = tde_open_ovec(vl);
+        tde_handle_t old_ov = tde_open_ovec(cl);
         if (old_ov) {
             uint32_t *ids = (uint32_t *)malloc((size_t)old_n * sizeof(uint32_t));
             if (ids) {
@@ -938,12 +1214,17 @@ POROOL_API int porool_ingest(const char *file_path,
     }
     p_free_chunks(chunks, nc);
 
-    int rc = tde_build_vectors_logical(vl, vecs, total, (uint32_t)d);
+    int rc = tde_build_vectors_logical(cl, vecs, total, (uint32_t)d);
     free(vecs);
     if (rc != TDE_OK) return -8;
 
-    registry_add(db, table);
     return 0;
+}
+
+POROOL_API int porool_ingest(const char *file_path,
+                              const char *db, const char *table)
+{
+    return porool_ingest_with_meta(file_path, db, table, NULL);
 }
 
 /* ── Multi-table retrieval ───────────────────────────────────────────────────*/
@@ -983,12 +1264,8 @@ POROOL_API SearchResult *porool_retrieve_from(float      *query_vector,
     if (!ids || !scores) { free(ids); free(scores); free(all); return NULL; }
 
     for (int t = 0; t < ntables && total_found < total_cap; t++) {
-        /* tables[t] is "db.tablename"; vecs logical name appends "_vec" */
-        char vl[264];
-        snprintf(vl, sizeof(vl), "%.256s_vec", tables[t]);
-
         tde_handle_t chunks_h = tde_open_odat(tables[t]);
-        tde_handle_t vecs_h   = tde_open_ovec(vl);
+        tde_handle_t vecs_h   = tde_open_ovec(tables[t]);
         if (!chunks_h || !vecs_h) {
             if (chunks_h) tde_close(chunks_h);
             if (vecs_h)   tde_close(vecs_h);
@@ -1002,10 +1279,9 @@ POROOL_API SearchResult *porool_retrieve_from(float      *query_vector,
             int space = total_cap - total_found;
             int take  = found < space ? found : space;
             for (int i = 0; i < take; i++) {
-                all[total_found + i].id     = ids[i];
-                all[total_found + i].score  = scores[i];
-                all[total_found + i].text   = fetch_string(chunks_h, (int)ids[i], 0);
-                all[total_found + i].source = fetch_string(chunks_h, (int)ids[i], 1);
+                all[total_found + i].id    = ids[i];
+                all[total_found + i].score = scores[i];
+                fill_result_meta(&all[total_found + i], chunks_h, (int)ids[i]);
             }
             total_found += take;
         }
@@ -1022,10 +1298,8 @@ POROOL_API SearchResult *porool_retrieve_from(float      *query_vector,
     /* Sort merged results best-first and trim to top_k */
     qsort(all, (size_t)total_found, sizeof(SearchResult), cmp_results_desc);
     if (total_found > top_k) {
-        for (int i = top_k; i < total_found; i++) {
-            free(all[i].text);
-            free(all[i].source);
-        }
+        for (int i = top_k; i < total_found; i++)
+            free_result_fields(&all[i]);
         total_found = top_k;
     }
 
@@ -1090,18 +1364,16 @@ POROOL_API SearchResult *porool_retrieve_target(float      *query_vector,
 
     int total = 0;
     for (int t = 0; t < ntables && total < cap; t++) {
-        char vl[264]; snprintf(vl, sizeof(vl), "%.256s_vec", tables[t]);
         tde_handle_t ch = tde_open_odat(tables[t]);
-        tde_handle_t vh = tde_open_ovec(vl);
+        tde_handle_t vh = tde_open_ovec(tables[t]);
         if (!ch || !vh) { if (ch) tde_close(ch); if (vh) tde_close(vh); continue; }
         int found = tde_vector_search_topk(vh, query_vector, (uint32_t)d, (uint32_t)top_k, ids, scores);
         int space = cap - total;
         int take  = found < space ? found : space;
         for (int i = 0; i < take; i++) {
-            all[total + i].id     = ids[i];
-            all[total + i].score  = scores[i];
-            all[total + i].text   = fetch_string(ch, (int)ids[i], 0);
-            all[total + i].source = fetch_string(ch, (int)ids[i], 1);
+            all[total + i].id    = ids[i];
+            all[total + i].score = scores[i];
+            fill_result_meta(&all[total + i], ch, (int)ids[i]);
         }
         total += take;
         tde_close(ch); tde_close(vh);
@@ -1110,7 +1382,7 @@ POROOL_API SearchResult *porool_retrieve_target(float      *query_vector,
     if (total == 0) { free(all); *result_count = 0; return NULL; }
 
     qsort(all, (size_t)total, sizeof(SearchResult), cmp_results_desc);
-    for (int i = top_k; i < total; i++) { free(all[i].text); free(all[i].source); }
+    for (int i = top_k; i < total; i++) free_result_fields(&all[i]);
     *result_count = total < top_k ? total : top_k;
     return all;
 #undef ALL_MAX
@@ -1188,6 +1460,27 @@ POROOL_API int porool_phrasing_add(const char *pattern, int is_prefix)
     return 0;
 }
 
+/* ── Synonym API ─────────────────────────────────────────────────────────────*/
+
+/*
+ * Register a query-expansion synonym: occurrences of `from` (whole-word,
+ * case-insensitive) in a query will cause `to` to be appended before embedding.
+ * Returns 0 on success, -1 if `from` already registered, -2 on bad args,
+ * -3 if the synonym table is full.
+ */
+POROOL_API int porool_synonym_add(const char *from, const char *to)
+{
+    if (!from || !from[0] || !to || !to[0]) return -2;
+    synonyms_ensure_defaults();
+    for (int i = 0; i < g_n_synonyms; i++)
+        if (strcmp(g_synonyms[i].from, from) == 0) return -1;
+    if (g_n_synonyms >= MAX_SYNONYMS) return -3;
+    snprintf(g_synonyms[g_n_synonyms].from, 64,  "%.63s",  from);
+    snprintf(g_synonyms[g_n_synonyms].to,   128, "%.127s", to);
+    g_n_synonyms++;
+    return 0;
+}
+
 /* ── Memory management ───────────────────────────────────────────────────────*/
 
 POROOL_API void porool_free(char *ptr)
@@ -1198,9 +1491,7 @@ POROOL_API void porool_free(char *ptr)
 POROOL_API void porool_free_results(SearchResult *results, int count)
 {
     if (!results) return;
-    for (int i = 0; i < count; i++) {
-        free(results[i].text);
-        free(results[i].source);
-    }
+    for (int i = 0; i < count; i++)
+        free_result_fields(&results[i]);
     free(results);
 }
