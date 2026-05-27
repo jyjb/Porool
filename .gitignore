@@ -1,0 +1,32 @@
+# ── Build output (all compiled artifacts go here — never commit) ──────────────
+build/
+
+# ── Legacy output directories (purged; kept here as a safety net) ─────────────
+obj/
+lib/
+bin/
+
+# ── Compiled file types (belt-and-suspenders for stray artifacts) ─────────────
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+
+# ── Runtime lock files (created by Tharavu on open tables) ───────────────────
+*.lock
+
+# ── CMake generated files ─────────────────────────────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+install_manifest.txt
+
+# ── IDE configuration ─────────────────────────────────────────────────────────
+.vscode/
+*.user
+*.suo
+.idea/

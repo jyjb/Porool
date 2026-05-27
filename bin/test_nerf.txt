@@ -1,7 +1,0 @@
-Neural Radiance Fields (NeRF) is a technique for synthesizing novel views of complex 3D scenes. It represents a scene as a continuous volumetric function parameterized by a neural network.
-
-NeRF works by training a multilayer perceptron (MLP) to map a 5D input (3D position plus 2D viewing direction) to color and volume density values. Volume rendering is then used to accumulate these values into 2D images.
-
-The training process requires a set of posed images of the scene. Each training ray is cast through the image and the MLP is queried at multiple sample points along the ray. The predicted colors and densities are composited to reconstruct the training image and the loss is back-propagated into the network weights.
-
-NeRF produces photorealistic novel view synthesis results but is slow to train and render. Later variants such as Instant NGP and 3D Gaussian Splatting address these speed limitations while preserving image quality.
