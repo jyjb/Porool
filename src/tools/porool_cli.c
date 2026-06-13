@@ -20,6 +20,7 @@
 
 #include "../include/porool.h"
 #include "../include/tharavu_dll.h"   /* stats / peek / phrasing-list use tde directly */
+#include "slispmanager.h"             /* read porool.ocfg for tde_set_base_path */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,11 +30,25 @@
 
 #ifdef _WIN32
 #  include <windows.h>
+#  define SK_CALL __cdecl
 #  define strcasecmp _stricmp
+#else
+#  define SK_CALL
 #endif
 
+/* SORKUVAI forward declarations — caller manages lifecycle per directive 2026-05-30 */
+extern int  SK_CALL ve_init(const char *logical_name, const char *ini_path);
+extern void SK_CALL ve_cleanup(void);
+
+/* THARAVU additional forward declaration — tde_get_base_path not in porool's tharavu_dll.h */
+#ifdef _WIN32
+#  define TDE_CALL __cdecl
+#else
+#  define TDE_CALL
+#endif
+extern const char *TDE_CALL tde_get_base_path(void);
+
 #define DEFAULT_INI        "tharavu.ini"
-#define DEFAULT_POROOL_INI "porool.ini"
 #define DEFAULT_TOPK       5
 #define DEFAULT_MAX_CHARS  2000
 
@@ -83,44 +98,28 @@ static char *get_str(tde_handle_t h, int row, int col)
 static void lname(char *out, int sz, const char *db, const char *tbl)
 { snprintf(out, sz, "%s.%s", db, tbl); }
 
-static void ensure_porool_ini(const char *path)
-{
-    FILE *fp = fopen(path, "r");
-    if (fp) { fclose(fp); return; }
-    fp = fopen(path, "w");
-    if (!fp) return;
-    fprintf(fp,
-        "; Porool configuration file\n\n"
-        "; tharavu_ini is no longer read — host must call tde_config_load() before porool_init()\n"
-        "[porool]\n"
-        "data_dir              = ./data\n"
-        "chunks_table          = porool.chunks\n"
-        "vectors_table         = porool.chunks\n"
-        "top_k_default         = 10\n"
-        "max_context_chars     = 2000\n"
-        "optimal_chunk_len     = 500.0\n"
-        "length_penalty_sigma  = 200.0\n"
-        "default_source_weight = 1.0\n"
-        "vocabularies          = general\n\n"
-        "[general]\n"
-        "english = general/english.ovoc\n"
-        "french  = general/french.ovoc\n\n"
-        "[scoring]\n"
-        "; Composite score = cosine*w1 + length_score*w2 + source_score*w3\n"
-        ";   + definition_signal*w4  (only when query is definitional, e.g. \"what is X?\")\n"
-        "; w1+w2+w3 should sum to 1.0; w4 is an additive bonus (0 = disabled)\n"
-        "w1 = 0.60\n"
-        "w2 = 0.20\n"
-        "w3 = 0.20\n"
-        "w4 = 0.15\n"
-        "w5 = 0.20\n\n"
-        "[source_weights]\n"
-        "; Per-source priority multipliers.  Range [0.0, 2.0]; values outside are clamped.\n"
-        "; Add entries in the form:  source_name = weight\n"
-        "; Example:  my_docs = 1.5\n"
-    );
-    fclose(fp);
-    fprintf(stderr, "porool: created default %s\n", path);
+/* Read porool.ocfg via SLispManager — configure THARAVU base path + vocab name.
+ * Falls back to ./knowledge if ocfg is absent or missing the section. */
+#define DEFAULT_POROOL_OCFG "porool.ocfg"
+static char s_vocab_name[128] = "general.languages";
+
+static void configure_from_ocfg(const char *ocfg_path) {
+    slm_node_t *cfg = slm_load(ocfg_path);
+    if (!cfg) {
+        tde_set_base_path("./knowledge");
+        return;
+    }
+    slm_node_t *pr = slm_find(cfg, "porool");
+    if (pr) {
+        const char *dd = slm_attr(pr, "data_dir");
+        if (dd && dd[0]) tde_set_base_path(dd);
+        else             tde_set_base_path("./knowledge");
+        const char *vn = slm_attr(pr, "vocab_name");
+        if (vn && vn[0]) strncpy(s_vocab_name, vn, sizeof(s_vocab_name) - 1);
+    } else {
+        tde_set_base_path("./knowledge");
+    }
+    slm_free(cfg);
 }
 
 /* ── print_results ───────────────────────────────────────────────────────── */
@@ -188,7 +187,7 @@ static int cmd_ingest(int argc, char **argv)
     }
 
     const char *infile = argv[2];
-    const char *db = NULL, *table = NULL, *ini = DEFAULT_POROOL_INI;
+    const char *db = NULL, *table = NULL, *ini = DEFAULT_POROOL_OCFG;
     ChunkMeta meta = {0};
 
     for (int i = 3; i < argc; i++) {
@@ -207,13 +206,16 @@ static int cmd_ingest(int argc, char **argv)
         return 1;
     }
 
-    if (porool_init(ini) != 0) {
+    porool_config_t pcfg;
+    porool_config_defaults(&pcfg);
+    porool_t *p = porool_create(&pcfg);
+    if (!p) {
         fprintf(stderr, "porool: init failed\n");
         return 1;
     }
 
-    int rc = porool_ingest_with_meta(infile, db, table, &meta);
-    porool_shutdown();
+    int rc = porool_ingest_with_meta(p, infile, db, table, &meta);
+    porool_destroy(p);
 
     if (rc < 0) {
         fprintf(stderr, "porool: ingest failed (%d)\n", rc);
@@ -241,7 +243,7 @@ static int cmd_query(int argc, char **argv)
     }
 
     const char *query_text     = argv[2];
-    const char *db = NULL, *table = NULL, *ini = DEFAULT_POROOL_INI;
+    const char *db = NULL, *table = NULL, *ini = DEFAULT_POROOL_OCFG;
     const char *concept_filter = NULL;
     int topk = DEFAULT_TOPK, max_chars = DEFAULT_MAX_CHARS;
 
@@ -256,7 +258,10 @@ static int cmd_query(int argc, char **argv)
     if (topk <= 0)      topk      = DEFAULT_TOPK;
     if (max_chars <= 0) max_chars = DEFAULT_MAX_CHARS;
 
-    if (porool_init(ini) != 0) {
+    porool_config_t pcfg;
+    porool_config_defaults(&pcfg);
+    porool_t *p = porool_create(&pcfg);
+    if (!p) {
         fprintf(stderr, "porool: init failed\n");
         return 1;
     }
@@ -272,14 +277,14 @@ static int cmd_query(int argc, char **argv)
 
     float *qv = NULL;
     int    dim = 0;
-    if (porool_embed_query(query_text, &qv, &dim) != 0 || !qv) {
+    if (porool_embed_query(p, query_text, &qv, &dim) != 0 || !qv) {
         fprintf(stderr, "porool: embedding failed\n");
-        porool_shutdown();
+        porool_destroy(p);
         return 1;
     }
 
     int count = 0;
-    SearchResult *results = porool_retrieve_target(qv, target, topk, &count);
+    SearchResult *results = porool_retrieve_target(p, qv, target, topk, &count);
     free(qv);  /* allocated by porool_embed_query via malloc */
 
     if (!results || count == 0) {
@@ -287,14 +292,14 @@ static int cmd_query(int argc, char **argv)
         json_print_str(query_text);
         printf(", \"results\": []}\n");
         if (results) porool_free_results(results, count);
-        porool_shutdown();
+        porool_destroy(p);
         return 0;
     }
 
-    porool_rerank_query(results, count, query_text);
+    porool_rerank_query(p, results, count, query_text);
     print_results(results, count, topk, max_chars, query_text, concept_filter);
     porool_free_results(results, count);
-    porool_shutdown();
+    porool_destroy(p);
     return 0;
 }
 
@@ -316,10 +321,8 @@ static int cmd_stats(int argc, char **argv)
     char cl[512];
     lname(cl, sizeof(cl), db, table);
 
-    if (tde_config_load(ini) != TDE_OK) {
-        fprintf(stderr, "porool: tde_config_load(%s) failed\n", ini);
-        return 1;
-    }
+    /* tde_config_load removed 2026-05-29; use tde default base path "./data" */
+    (void)ini;
 
     tde_handle_t ch = tde_open_odat(cl);
     tde_handle_t ov = tde_open_ovec(cl);
@@ -359,10 +362,8 @@ static int cmd_peek(int argc, char **argv)
     char cl[256];
     lname(cl, sizeof(cl), db, table);
 
-    if (tde_config_load(ini) != TDE_OK) {
-        fprintf(stderr, "porool: tde_config_load(%s) failed\n", ini);
-        return 1;
-    }
+    /* tde_config_load removed 2026-05-29; use tde default base path "./data" */
+    (void)ini;
 
     tde_handle_t ch = tde_open_odat(cl);
     if (!ch) {
@@ -418,10 +419,8 @@ static int cmd_phrasing(int argc, char **argv)
     }
 
     if (!strcmp(action, "list")) {
-        if (tde_config_load(ini) != TDE_OK) {
-            fprintf(stderr, "porool: tde_config_load(%s) failed\n", ini);
-            return 1;
-        }
+        /* tde_config_load removed 2026-05-29; use tde default base path */
+        (void)ini;
         const char *tables[] = { PHRASE_PREFIXES_LOGICAL, PHRASE_MARKERS_LOGICAL };
         const char *labels[] = { "query_prefixes", "chunk_markers" };
         for (int t = 0; t < 2; t++) {
@@ -460,15 +459,17 @@ static int cmd_phrasing(int argc, char **argv)
         return 1;
     }
 
-    /* add-* needs porool_init; if user passed --ini assume it's porool.ini */
-    const char *porool_ini = strcmp(ini, DEFAULT_INI) == 0 ? DEFAULT_POROOL_INI : ini;
-    if (porool_init(porool_ini) != 0) {
+    /* add-* needs porool instance */
+    porool_config_t pcfg;
+    porool_config_defaults(&pcfg);
+    porool_t *p = porool_create(&pcfg);
+    if (!p) {
         fprintf(stderr, "porool: init failed\n");
         return 1;
     }
 
-    int rc = porool_phrasing_add(pattern, is_prefix);
-    porool_shutdown();
+    int rc = porool_phrasing_add(p, pattern, is_prefix);
+    porool_destroy(p);
 
     if      (rc == -1) { fprintf(stderr, "porool: duplicate — '%s' already exists\n", pattern); return 1; }
     else if (rc == -2) { fprintf(stderr, "porool: failed to save phrasing table\n"); return 1; }
@@ -656,23 +657,30 @@ static int launched_from_explorer(void)
 
 int main(int argc, char **argv)
 {
-    ensure_porool_ini(DEFAULT_POROOL_INI);
+    /* Read porool.ocfg — sets tde base path + vocab name.  No porool.ini created. */
+    configure_from_ocfg(DEFAULT_POROOL_OCFG);
+    if (ve_init(s_vocab_name, NULL) != 0) {
+        fprintf(stderr, "porool: SORKUVAI init failed\n");
+        return 1;
+    }
 
+    int rc = 1;
     if (argc < 2) {
 #ifdef _WIN32
         (void)launched_from_explorer();
 #endif
         cmd_interactive();
-        return 0;
+        rc = 0;
+    } else if (!strcmp(argv[1], "ingest"))   { rc = cmd_ingest   (argc, argv); }
+    else if   (!strcmp(argv[1], "query"))    { rc = cmd_query    (argc, argv); }
+    else if   (!strcmp(argv[1], "stats"))    { rc = cmd_stats    (argc, argv); }
+    else if   (!strcmp(argv[1], "peek"))     { rc = cmd_peek     (argc, argv); }
+    else if   (!strcmp(argv[1], "phrasing")) { rc = cmd_phrasing (argc, argv); }
+    else {
+        fprintf(stderr, "porool: unknown command '%s'\n\n", argv[1]);
+        usage();
     }
 
-    if (!strcmp(argv[1], "ingest"))   return cmd_ingest   (argc, argv);
-    if (!strcmp(argv[1], "query"))    return cmd_query    (argc, argv);
-    if (!strcmp(argv[1], "stats"))    return cmd_stats    (argc, argv);
-    if (!strcmp(argv[1], "peek"))     return cmd_peek     (argc, argv);
-    if (!strcmp(argv[1], "phrasing")) return cmd_phrasing (argc, argv);
-
-    fprintf(stderr, "porool: unknown command '%s'\n\n", argv[1]);
-    usage();
-    return 1;
+    ve_cleanup();
+    return rc;
 }

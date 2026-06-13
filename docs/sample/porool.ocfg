@@ -1,0 +1,14 @@
+; Porool sample configuration
+(porool
+  (data_dir              "./data")
+  (chunks_table          "porool.chunks")
+  (vectors_table         "porool.chunks")
+  (top_k_default         10)
+  (max_context_chars     2000)
+  (ctx_min_score         0.0)
+  (optimal_chunk_len     500.0)
+  (length_penalty_sigma  200.0)
+  (default_source_weight 1.0)
+  (vocab_name            "general.english")
+  (scoring (w1 0.60) (w2 0.20) (w3 0.20) (w4 0.15) (w5 0.20))
+  (source_weights))

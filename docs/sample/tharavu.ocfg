@@ -1,0 +1,5 @@
+; Tharavu configuration for Porool sample / tests
+(tharavu
+  (data_dir "./data")
+  (dim      64)
+  (hash_cap 131072))

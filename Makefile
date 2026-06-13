@@ -22,11 +22,16 @@ SK_BIN       = $(SORKUVAI_DIR)/build
 THARAVU_DIR  = ../Tharavu
 TH_LIB       = $(THARAVU_DIR)/build
 
-CFLAGS += -I$(SK_INC)
+# SLispManager for .ocfg loading
+SLM_DIR      = ../sLispManager
+SLM_INC      = $(SLM_DIR)/src/include
+SLM_LIB      = $(SLM_DIR)/build
+
+CFLAGS += -I$(SK_INC) -I$(THARAVU_DIR)/src/include -I$(SLM_INC)
 
 ifeq ($(OS),Windows_NT)
-    DLL         = build/porool.dll
-    IMPLIB      = build/libporool.a
+    DLL         = build/libporool.dll
+    IMPLIB      = build/libporool.dll.a
     DLL_LDFLAGS = -shared -Wl,--out-implib,$(IMPLIB)
     EXE         = .exe
     RM          = rm -f
@@ -46,7 +51,7 @@ endif
 
 OBJ_DIR = build/obj
 CLI     = build/porool$(EXE)
-LDSK    = -L$(SK_LIB) -L$(TH_LIB) -lsorkuvai_dll -ltharavu_dll
+LDSK    = -L$(SK_LIB) -L$(TH_LIB) -L$(SLM_LIB) -lsorkuvai_dll -ltharavu_dll -lslispmanager
 
 # ── Core object files ─────────────────────────────────────────────────────────
 # porool_extract is compiled twice: once with POROOL_EXPORTS (for the DLL) and
@@ -91,7 +96,8 @@ $(DLL): src/porool.c src/include/porool.h src/include/porool_extract.h \
 $(CLI): src/tools/porool_cli.c src/include/porool.h src/include/tharavu_dll.h \
         $(DLL) | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -o $@ src/tools/porool_cli.c \
-	    -Lbuild -lporool -L$(SK_LIB) -L$(TH_LIB) -ltharavu_dll -lm
+	    -Lbuild -lporool -L$(SK_LIB) -L$(TH_LIB) -L$(SLM_LIB) \
+	    -lsorkuvai_dll -ltharavu_dll -lslispmanager -lm
 
 # ── Pattern rule: build each test binary from test/*.c ────────────────────────
 build/%$(EXE): test/%.c src/include/porool.h $(DLL) | $(OBJ_DIR)
